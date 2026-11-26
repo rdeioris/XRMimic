@@ -383,8 +383,26 @@ Linux notes:
 
 ```powershell
 cargo test --workspace
+python tests\xrmimic_test.py
 node tools\smoke\smoke.mjs
 ```
+
+`tests/xrmimic_test.py` checks every feature from Python with nothing but the
+standard library: `ctypes` loads `xrmimic_runtime.dll` the way the OpenXR
+loader does, makes a D3D11 device through `d3d11.dll`, and renders with plain
+clears and texture uploads; `unittest` runs 19 tests (about a minute), each
+in its own process because XRMimic reads some settings once per process. They
+cover the API (extensions, properties, strings and paths, the session's
+states, reference spaces and STAGE bounds, swapchain formats and the errors a
+runtime must give, frame pacing, time conversion, actions, bound sources,
+haptics), the simulated head motion, a controller put down by itself, the
+Input tab, hands, a device preset and a play-area change, and in the window's
+snapshots: projection, quad (both eyes, one eye), cylinder, equirect and cube
+layers, MSAA colour and depth, the Depth and Centre views, reprojection with
+and without depth, depth-tested layers, the boundary and the haptics bar.
+`-v -k <name>` runs one; `--scenario <name>` runs one scenario in this process
+and prints its checks; `XRMIMIC_TEST_DLL` points it at another build (a build
+with six features broken on purpose fails exactly the tests for them).
 
 The unit tests cover the pose and projection math, frame pacing, binding paths
 and the runtime list. The smoke check starts its own off-screen Chrome against
