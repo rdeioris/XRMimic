@@ -379,9 +379,12 @@ Chrome 157 and newer can do WebXR through OpenXR on Linux, behind
 `--enable-features=OpenXR`, with a Vulkan binding (`XR_KHR_vulkan_enable2`).
 XRMimic builds there as `libxrmimic_runtime.so`: it creates Chrome's Vulkan instance
 and device, hands out swapchain images on that device, and simulates the user
-exactly as on Windows. There is no headset window on Linux yet: the user is
-driven by the `XRMIMIC_TEST_*` hooks only, and frames can be checked with
-`XRMIMIC_CAPTURE`.
+exactly as on Windows. It also offers `XR_KHR_convert_timespec_time` (XrTime
+is `CLOCK_MONOTONIC` in nanoseconds), which LÖVR requires. There is no headset
+window on Linux yet: the user is driven by the `XRMIMIC_TEST_*` hooks and the
+control API, and frames can be checked with `XRMIMIC_CAPTURE` (projection
+colour only). The control API's `/v1/capture/eyes` and `/v1/capture/window`
+are not available on Linux.
 
 ```sh
 cargo build --release -p xrmimic-runtime

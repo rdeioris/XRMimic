@@ -11,7 +11,7 @@ use std::ffi::{c_void, CStr};
 use std::sync::{Arc, Mutex};
 
 /// The extensions this backend adds.
-pub const EXTENSIONS: &[(&str, u32)] = &[("XR_KHR_vulkan_enable2", 2)];
+pub const EXTENSIONS: &[(&str, u32)] = &[("XR_KHR_vulkan_enable2", 2), ("XR_KHR_convert_timespec_time", 1)];
 
 /// Formats offered to apps, preferred first (Chrome takes the first of
 /// BGRA sRGB, BGRA, RGBA sRGB, RGBA that it finds).
@@ -68,9 +68,40 @@ pub fn lookup(name: &str) -> Option<xr::pfn::VoidFunction> {
             "xrCreateVulkanInstanceKHR" => t(create_instance as xr::pfn::CreateVulkanInstanceKHR),
             "xrGetVulkanGraphicsDevice2KHR" => t(graphics_device as xr::pfn::GetVulkanGraphicsDevice2KHR),
             "xrCreateVulkanDeviceKHR" => t(create_device as xr::pfn::CreateVulkanDeviceKHR),
+            "xrConvertTimespecTimeToTimeKHR" => t(timespec_to_time as xr::pfn::ConvertTimespecTimeToTimeKHR),
+            "xrConvertTimeToTimespecTimeKHR" => t(time_to_timespec as xr::pfn::ConvertTimeToTimespecTimeKHR),
             _ => return None,
         })
     }
+}
+
+// XR_KHR_convert_timespec_time: XrTime is CLOCK_MONOTONIC in nanoseconds.
+unsafe extern "system" fn timespec_to_time(
+    _instance: xr::Instance,
+    ts: *const libc::timespec,
+    out: *mut xr::Time,
+) -> xr::Result {
+    crate::traced!("xrConvertTimespecTimeToTimeKHR", [_instance], || {
+        let ts = &*ts;
+        *out = xr::Time::from_nanos(ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64);
+        xr::Result::SUCCESS
+    })
+}
+
+unsafe extern "system" fn time_to_timespec(
+    _instance: xr::Instance,
+    t: xr::Time,
+    out: *mut libc::timespec,
+) -> xr::Result {
+    crate::traced!("xrConvertTimeToTimespecTimeKHR", [_instance, t], || {
+        let ns = t.as_nanos();
+        if ns <= 0 {
+            return xr::Result::ERROR_TIME_INVALID;
+        }
+        (*out).tv_sec = (ns / 1_000_000_000) as _;
+        (*out).tv_nsec = (ns % 1_000_000_000) as _;
+        xr::Result::SUCCESS
+    })
 }
 
 unsafe extern "system" fn requirements(
