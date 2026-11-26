@@ -847,6 +847,47 @@ struct OpenedQuad {
     srvs: Vec<ID3D11ShaderResourceView>,
 }
 
+/// A layer's picture with a full mip chain, so layers seen small or at a
+/// slant are filtered instead of aliasing: the newest ring texture is copied
+/// into mip 0 and the rest generated, once per new frame.
+struct MippedLayer {
+    generation: u64,
+    rings: Vec<ID3D11Texture2D>,
+    tex: ID3D11Texture2D,
+    srv: ID3D11ShaderResourceView,
+    /// The ring index last copied in (a new frame always moves it on).
+    filled: Option<usize>,
+}
+
+/// A mipmapped copy of a ring texture's size and format, or None if the
+/// format cannot have generated mips (the layer is then drawn from mip 0 only).
+unsafe fn make_mipped(device: &ID3D11Device, ring: &ID3D11Texture2D) -> Option<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
+    let mut d = D3D11_TEXTURE2D_DESC::default();
+    ring.GetDesc(&mut d);
+    if d.Width < 2 && d.Height < 2 {
+        return None;
+    }
+    let desc = D3D11_TEXTURE2D_DESC {
+        MipLevels: 0,
+        ArraySize: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+        ..d
+    };
+    let mut tex = None;
+    if let Err(e) = device.CreateTexture2D(&desc, None, Some(&mut tex)) {
+        xlog!("mipmapped layer texture {}x{} format {} failed: {e:?}", d.Width, d.Height, d.Format.0);
+        return None;
+    }
+    let tex = tex?;
+    let mut srv = None;
+    device.CreateShaderResourceView(&tex, None, Some(&mut srv)).ok()?;
+    Some((tex, srv?))
+}
+
 struct Opened {
     generation: u64,
     srvs: Vec<ID3D11ShaderResourceView>,
@@ -1231,12 +1272,16 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
         let premultiplied = blend_state(D3D11_BLEND_ONE)?;
         let straight = blend_state(D3D11_BLEND_SRC_ALPHA)?;
         let mut opened_quads: Vec<Option<OpenedQuad>> = Vec::new();
+        let mut mipped_quads: Vec<Option<MippedLayer>> = Vec::new();
         let mut vs = None;
         let mut ps = None;
         device.CreateVertexShader(&vs_code, None, Some(&mut vs))?;
         device.CreatePixelShader(&ps_code, None, Some(&mut ps))?;
         let sdesc = D3D11_SAMPLER_DESC {
-            Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            // Anisotropic: layers are often seen at a slant (a cylinder's sides,
+            // an equirect band); trilinear between the layers' mips.
+            Filter: D3D11_FILTER_ANISOTROPIC,
+            MaxAnisotropy: 8,
             AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
             AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
             AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -1366,17 +1411,21 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
             }
             // Quad layers' textures, (re)opened when the runtime made new ones.
             opened_quads.resize_with(quads.len(), || None);
+            mipped_quads.resize_with(quads.len(), || None);
             for (i, q) in quads.iter().enumerate() {
                 if opened_quads[i].as_ref().map(|o| o.generation) == Some(q.generation) {
                     continue;
                 }
                 let mut srvs = Vec::new();
+                let mut rings = Vec::new();
                 for h in &q.handles {
                     let srv = device1
                         .OpenSharedResource1::<ID3D11Texture2D>(HANDLE(*h as _))
                         .and_then(|tex| {
                             let mut srv = None;
-                            device.CreateShaderResourceView(&tex, None, Some(&mut srv)).map(|()| srv.unwrap())
+                            device.CreateShaderResourceView(&tex, None, Some(&mut srv))?;
+                            rings.push(tex);
+                            Ok(srv.unwrap())
                         });
                     match srv {
                         Ok(s) => srvs.push(s),
@@ -1386,8 +1435,22 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
                         }
                     }
                 }
-                opened_quads[i] =
-                    (srvs.len() == q.handles.len()).then_some(OpenedQuad { generation: q.generation, srvs });
+                let ok = srvs.len() == q.handles.len();
+                opened_quads[i] = ok.then_some(OpenedQuad { generation: q.generation, srvs });
+                // Cube maps keep mip 0: their faces sit side by side, and smaller
+                // mips would bleed one face into the next.
+                let cube = matches!(q.meta.shape, crate::shared::Shape::Cube);
+                mipped_quads[i] = if ok && !cube {
+                    make_mipped(&device, &rings[0]).map(|(tex, srv)| MippedLayer {
+                        generation: q.generation,
+                        rings,
+                        tex,
+                        srv,
+                        filled: None,
+                    })
+                } else {
+                    None
+                };
             }
             if generation != 0 && opened.as_ref().map(|o| o.generation) != Some(generation) {
                 let open = || -> windows::core::Result<(Vec<ID3D11ShaderResourceView>, ID3D11Fence)> {
@@ -1507,6 +1570,15 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
                     context.Draw(3, 0);
                     // Quad layers, in order, over each eye, from that eye's pose.
                     if views.len() == 2 && !quads.is_empty() {
+                        // Fill each layer's mip chain from its newest picture.
+                        for m in mipped_quads.iter_mut().flatten() {
+                            let k = latest % m.rings.len();
+                            if m.filled != Some(k) {
+                                context.CopySubresourceRegion(&m.tex, 0, 0, 0, 0, &m.rings[k], 0, None);
+                                context.GenerateMips(&m.srv);
+                                m.filled = Some(k);
+                            }
+                        }
                         context.VSSetShader(qvs.as_ref(), None);
                         context.PSSetShader(qps.as_ref(), None);
                         context.RSSetState(no_cull.as_ref());
@@ -1556,7 +1628,11 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
                                     crate::shared::Blend::Straight => straight.as_ref(),
                                 };
                                 context.OMSetBlendState(blend, None, 0xffff_ffff);
-                                context.PSSetShaderResources(0, Some(&[Some(oq.srvs[latest % oq.srvs.len()].clone())]));
+                                let srv = match mipped_quads.get(i).and_then(|m| m.as_ref()) {
+                                    Some(m) if m.generation == oq.generation && m.filled.is_some() => m.srv.clone(),
+                                    _ => oq.srvs[latest % oq.srvs.len()].clone(),
+                                };
+                                context.PSSetShaderResources(0, Some(&[Some(srv)]));
                                 // Depth-tested layers: against this eye's depth, if it sent one.
                                 let eye_depth = q.meta.depth_test.and_then(|op| {
                                     let (i, d) = depth.iter().enumerate().find(|(_, d)| d.eye == e)?;

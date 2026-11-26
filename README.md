@@ -482,7 +482,11 @@ action refused), STAGE's bounds, and that a controller put down by itself
   premultiplied or straight alpha, per-eye visibility), drawn from the eye
   poses of the frame they came with. An equirect layer at infinity (radius 0
   or +inf) and every cube layer are drawn 500 m away, centred on each eye;
-  cube maps use the standard Vulkan / D3D face lookup. Linux has no window,
+  cube maps use the standard Vulkan / D3D face lookup. Quad, cylinder and
+  equirect layers are sampled from a mip chain the window generates from the
+  layer's top mip each frame (trilinear, 8x anisotropic), so small or slanted
+  layers do not alias; an app's own lower mips are not used, and cube layers
+  are sampled from their top mip only. Linux has no window,
   so no layers are drawn there (cube swapchains are accepted).
 - Depth buffers (`XR_KHR_composition_layer_depth`) are validated, traced and
   used by the Depth, Centre and Reproject views and depth-tested layers (D16,
