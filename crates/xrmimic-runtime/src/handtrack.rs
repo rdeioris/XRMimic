@@ -6,7 +6,6 @@
 use crate::api::{find_in_chain, space_pose};
 use crate::state::rt;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 use xr::Handle as _;
 use xrmimic_core::hands::{hand_joints, pinch_point, wrist_pose, JOINT_COUNT};
@@ -100,8 +99,8 @@ pub unsafe extern "system" fn locate_hand_joints(
             return xr::Result::ERROR_HANDLE_INVALID;
         };
         let base = space_pose(&rt, (*info).base_space.into_raw());
-        let hands = s.gfx.shared.hands.load(Ordering::SeqCst);
-        let joints = stage_joints(&s.sim.lock().unwrap(), hands, hand);
+        let hands = s.headset.hands();
+        let joints = stage_joints(&s.headset.user(), hands, hand);
         let locations = std::slice::from_raw_parts_mut(out.joint_locations, JOINT_COUNT);
         let tracked = xr::SpaceLocationFlags::ORIENTATION_VALID
             | xr::SpaceLocationFlags::POSITION_VALID

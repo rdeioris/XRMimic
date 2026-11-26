@@ -198,7 +198,7 @@ fn choose_profile(rt: &Runtime, instance: u64, hands: bool) -> u64 {
         let names: Vec<&str> = xrmimic_core::device::HAND_PROFILES.iter().map(|(p, _, _)| *p).collect();
         return pick(&names);
     }
-    let wanted = crate::devstore::current().controllers;
+    let wanted = crate::headset::device().controllers;
     let profile = pick(&[wanted.as_str(), TOUCH_PROFILE, SIMPLE_PROFILE]);
     if rt.path_id(&wanted) != profile {
         xlog!("the app suggested no bindings for {wanted}; reporting {}", rt.path_str(profile).unwrap_or("none"));
@@ -215,7 +215,7 @@ pub fn refresh_profile(rt: &mut Runtime, h: u64, initial: bool) {
     if s.attached_sets.is_empty() {
         return;
     }
-    let hands = s.gfx.shared.hands.load(std::sync::atomic::Ordering::SeqCst);
+    let hands = s.headset.hands();
     if !initial && hands == s.hands {
         return;
     }
@@ -243,9 +243,7 @@ pub fn refresh_profile(rt: &mut Runtime, h: u64, initial: bool) {
     let changed = s.profile != profile;
     s.hands = hands;
     s.profile = profile;
-    *s.gfx.shared.profile.lock().unwrap() = name;
-    *s.gfx.shared.bound.lock().unwrap() = bound;
-    s.gfx.shared.attached.store(true, std::sync::atomic::Ordering::SeqCst);
+    s.headset.report_profile(&name, bound);
     if changed || (initial && profile != 0) {
         rt.push_event(instance, Event::ProfileChanged { session: h });
     }
@@ -285,7 +283,7 @@ pub unsafe extern "system" fn sync_actions(session: xr::Session, info: *const xr
         s.active_sets =
             (0..info.count_active_action_sets as usize).map(|i| (*info.active_action_sets.add(i)).action_set.into_raw()).collect();
         s.previous = s.snapshot;
-        s.snapshot = s.sim.lock().unwrap().controllers;
+        s.snapshot = s.headset.user().controllers;
         s.sync_time = time::now_ns();
         if s.state != xr::SessionState::FOCUSED {
             return xr::Result::SESSION_NOT_FOCUSED;
@@ -638,9 +636,8 @@ pub unsafe extern "system" fn apply_haptic(
         let x = &*(haptic as *const xr::HapticVibration);
         let v = Vibration::from_xr(x.duration.as_nanos(), x.frequency, x.amplitude);
         let now = crate::time::now_ns();
-        let mut state = s.gfx.shared.haptics.lock().unwrap();
         for &hand in &hands {
-            state[hand].apply(v, now);
+            s.headset.haptic(hand, Some(v), now);
             xlog!("haptic: {} hand {}", if hand == LEFT { "left" } else { "right" }, v.describe());
         }
         xr::Result::SUCCESS
@@ -660,12 +657,10 @@ pub unsafe extern "system" fn stop_haptic(session: xr::Session, info: *const xr:
             return xr::Result::SESSION_NOT_FOCUSED;
         }
         let now = crate::time::now_ns();
-        let mut state = s.gfx.shared.haptics.lock().unwrap();
         for &hand in &hands {
-            if state[hand].playing.is_some() {
+            if s.headset.haptic(hand, None, now) {
                 xlog!("haptic: {} hand stopped", if hand == LEFT { "left" } else { "right" });
             }
-            state[hand].stop(now);
         }
         xr::Result::SUCCESS
     })

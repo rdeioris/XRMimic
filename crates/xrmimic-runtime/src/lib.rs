@@ -11,6 +11,7 @@ pub mod time;
 pub mod trace;
 
 mod api;
+mod headset;
 mod devstore;
 mod input;
 mod shared;
@@ -40,11 +41,11 @@ mod window;
 #[cfg(windows)]
 mod depthwatch;
 #[cfg(windows)]
-use window as headset;
+use window as ui;
 #[cfg(target_os = "linux")]
 mod headless;
 #[cfg(target_os = "linux")]
-use headless as headset;
+use headless as ui;
 
 pub use exports::*;
 

@@ -1,18 +1,14 @@
 //! Instance, system, session, space, swapchain and frame entry points.
 
 use crate::gfx::{self, SessionGfx};
-use crate::headset::Window;
-use crate::shared::Shared;
+use crate::headset::{self, Headset as _, HeadsetOptions, LocalHeadset};
 use crate::state::*;
 use crate::{time, xlog};
 use openxr_sys as xr;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, CStr};
-use std::sync::{Arc, Mutex};
 use xr::Handle as _;
 use xrmimic_core::math::{Fov, Pose, Quat, Vec3};
-use xrmimic_core::sim::SimState;
-use xrmimic_core::timing::FrameClock;
 
 pub const SYSTEM_ID: u64 = 0x5153_494d; // "QSIM"
 
@@ -22,7 +18,7 @@ pub fn extensions() -> Vec<(&'static str, u32)> {
     // Always: what the graphics backend needs. Then whatever the device
     // settings (Device tab) tick, from the optional ones xrmimic implements.
     let mut v = gfx::EXTENSIONS.to_vec();
-    let device = crate::devstore::current();
+    let device = headset::device();
     for (name, version, _) in xrmimic_core::device::OPTIONAL_EXTENSIONS {
         if device.extensions.iter().any(|e| e == name) {
             v.push((name, *version));
@@ -220,7 +216,7 @@ pub unsafe extern "system" fn poll_event(instance: xr::Instance, buf: *mut xr::E
                 s.instance == instance.into_raw()
                     && s.running
                     && !s.exit_requested
-                    && s.gfx.shared.close_requested.load(std::sync::atomic::Ordering::SeqCst)
+                    && s.headset.close_requested()
             })
             .map(|(k, _)| *k)
             .collect();
@@ -232,7 +228,7 @@ pub unsafe extern "system" fn poll_event(instance: xr::Instance, buf: *mut xr::E
         // Controllers put down or picked up: the interaction profile follows.
         let mine: Vec<u64> =
             rt.sessions.iter().filter(|(_, s)| s.instance == instance.into_raw()).map(|(k, _)| *k).collect();
-        let play_area = crate::devstore::current().play_area;
+        let play_area = headset::device().play_area;
         for s in mine {
             crate::input::refresh_profile(&mut rt, s, false);
             // The Device tab changed the play area: STAGE's bounds change.
@@ -354,7 +350,7 @@ pub unsafe extern "system" fn system_properties(
         if let Some(e) = check_system(instance, system) {
             return e;
         }
-        let d = crate::devstore::current();
+        let d = headset::device();
         let p = &mut *props;
         p.system_id = system;
         p.vendor_id = d.vendor_id;
@@ -432,7 +428,7 @@ pub unsafe extern "system" fn enumerate_views(
         if capacity < 2 {
             return xr::Result::ERROR_SIZE_INSUFFICIENT;
         }
-        let d = crate::devstore::current();
+        let d = headset::device();
         for i in 0..2 {
             let v = &mut *out.add(i);
             v.recommended_image_rect_width = d.eye_width;
@@ -476,13 +472,9 @@ pub unsafe extern "system" fn create_session(
         if let Some(e) = check_system(instance, (*info).system_id) {
             return e;
         }
-        let shared = Arc::new(Shared::default());
-        // XRMIMIC_HANDS=1: start with tracked hands instead of controllers.
-        if std::env::var("XRMIMIC_HANDS").is_ok_and(|v| v == "1") {
-            shared.hands.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        let target = LocalHeadset::frame_target();
         #[allow(unused_mut)] // changed below on Windows only
-        let mut gfx = match SessionGfx::from_session_create((*info).next, shared.clone()) {
+        let mut gfx = match SessionGfx::from_session_create((*info).next, target.clone()) {
             Ok(g) => g,
             Err(e) => return e,
         };
@@ -491,34 +483,35 @@ pub unsafe extern "system" fn create_session(
         {
             gfx.srgb_as_unorm =
                 rt.instances.get(&instance.into_raw()).is_some_and(|i| i.engine == "Chromium");
-            // Depth upside down relative to colour: Unity's URP sends it so on
-            // D3D11 whenever it renders through an intermediate texture, so
-            // Unity starts flipped; the window then checks the pictures and
-            // turns it over if they disagree (crate::depthcheck).
-            // XRMIMIC_DEPTH_FLIP=0 or 1 fixes it for any app (no checking);
-            // "detect" starts upright and checks.
-            let unity = rt.instances.get(&instance.into_raw()).is_some_and(|i| i.engine == "Unity");
-            let (flip, auto) = match std::env::var("XRMIMIC_DEPTH_FLIP").as_deref() {
-                Ok("1") => (true, false),
-                Ok("0") => (false, false),
-                Ok("detect") => (false, true),
-                _ => (unity, true),
-            };
-            gfx.shared.depth_flip.store(flip, std::sync::atomic::Ordering::Relaxed);
-            gfx.shared.depth_flip_auto.store(auto, std::sync::atomic::Ordering::Relaxed);
-            xlog!(
-                "depth images read {}{}",
-                if flip { "upside down" } else { "upright" },
-                if auto { ", checked against the colour" } else { " (XRMIMIC_DEPTH_FLIP)" }
-            );
         }
-        let app = rt.instances.get(&instance.into_raw()).map(|i| i.app_name.clone()).unwrap_or_default();
-        *shared.app_name.lock().unwrap() = app;
-        let device = crate::devstore::current();
-        let sim = Arc::new(Mutex::new(SimState::new(&device)));
-        let window = Window::spawn(&gfx, sim.clone(), shared);
-        let hz = std::env::var("XRMIMIC_REFRESH").ok().and_then(|s| s.parse().ok()).unwrap_or(device.default_refresh);
+        // Depth upside down relative to colour: Unity's URP sends it so on
+        // D3D11 whenever it renders through an intermediate texture, so Unity
+        // starts flipped; the window then checks the pictures and turns it
+        // over if they disagree (crate::depthwatch, Windows).
+        // XRMIMIC_DEPTH_FLIP=0 or 1 fixes it for any app (no checking);
+        // "detect" starts upright and checks.
+        let unity = rt.instances.get(&instance.into_raw()).is_some_and(|i| i.engine == "Unity");
+        let (flip, auto) = match std::env::var("XRMIMIC_DEPTH_FLIP").as_deref() {
+            Ok("1") => (true, false),
+            Ok("0") => (false, false),
+            Ok("detect") => (false, true),
+            _ => (unity, true),
+        };
+        xlog!(
+            "depth images read {}{}",
+            if flip { "upside down" } else { "upright" },
+            if auto { ", checked against the colour" } else { " (XRMIMIC_DEPTH_FLIP)" }
+        );
+        let options = HeadsetOptions {
+            app_name: rt.instances.get(&instance.into_raw()).map(|i| i.app_name.clone()).unwrap_or_default(),
+            // XRMIMIC_HANDS=1: start with tracked hands instead of controllers.
+            hands: std::env::var("XRMIMIC_HANDS").is_ok_and(|v| v == "1"),
+            depth_flip: flip,
+            depth_flip_auto: auto,
+        };
         let now = time::now_ns();
+        let headset = LocalHeadset::start(target, &gfx, options, now);
+        let hz = 1e9 / headset.period_ns() as f64;
         let h = rt.new_handle();
         rt.sessions.insert(
             h,
@@ -528,9 +521,7 @@ pub unsafe extern "system" fn create_session(
                 running: false,
                 exit_requested: false,
                 gfx,
-                sim,
-                window: Some(window),
-                clock: FrameClock::new(hz, now),
+                headset: Box::new(headset),
                 last_wake: now,
                 frame_begun: false,
                 frames_waited: 0,
@@ -545,10 +536,10 @@ pub unsafe extern "system" fn create_session(
                 sync_time: now,
                 active_sets: Vec::new(),
                 change_times: HashMap::new(),
-                stage_bounds: crate::devstore::current().play_area,
+                stage_bounds: headset::device().play_area,
             },
         );
-        xlog!("session {h} created ({hz} Hz)");
+        xlog!("session {h} created ({hz:.0} Hz)");
         rt.set_state(h, xr::SessionState::IDLE);
         rt.set_state(h, xr::SessionState::READY);
         *out = xr::Session::from_raw(h);
@@ -558,18 +549,18 @@ pub unsafe extern "system" fn create_session(
 
 pub unsafe extern "system" fn destroy_session(session: xr::Session) -> xr::Result {
     crate::traced!("xrDestroySession", [session], || {
-        let window = {
+        let stop = {
             let mut rt = rt();
             let Some(s) = rt.sessions.get_mut(&session.into_raw()) else {
                 return xr::Result::ERROR_HANDLE_INVALID;
             };
-            let w = s.window.take();
+            let stop = s.headset.shutdown();
             rt.drop_session(session.into_raw());
-            w
+            stop
         };
-        // Join the window thread outside the runtime lock.
-        if let Some(w) = window {
-            w.stop();
+        // Join the headset's threads outside the runtime lock.
+        if let Some(stop) = stop {
+            stop();
         }
         xr::Result::SUCCESS
     })
@@ -748,7 +739,7 @@ pub unsafe extern "system" fn reference_space_bounds(
 pub fn space_pose(rt: &Runtime, space: u64) -> Option<Pose> {
     let sp = rt.spaces.get(&space)?;
     let session = rt.sessions.get(&sp.session)?;
-    let sim = session.sim.lock().unwrap();
+    let sim = session.headset.user();
     let base = match sp.kind {
         SpaceKind::Reference(xr::ReferenceSpaceType::VIEW) => sim.head_pose(),
         SpaceKind::Reference(xr::ReferenceSpaceType::LOCAL | xr::ReferenceSpaceType::UNBOUNDED_MSFT) => {
@@ -980,15 +971,13 @@ pub unsafe extern "system" fn wait_frame(
                 return xr::Result::ERROR_SESSION_NOT_RUNNING;
             }
             let now = time::now_ns();
-            let wake = if std::env::var_os("XRMIMIC_VSYNC_GRID").is_some() {
-                s.clock.wake_after(s.last_wake, now)
-            } else {
-                s.clock.wake_free(s.last_wake, now)
-            };
+            let on_grid = std::env::var_os("XRMIMIC_VSYNC_GRID").is_some();
+            let wake = s.headset.next_wake(s.last_wake, now, on_grid);
+            let period = s.headset.period_ns();
             let st = &mut s.stats;
             if st.ended > 0 {
                 st.to_next_wait += now - st.ended;
-                st.skipped += ((wake - s.last_wake - s.clock.period_ns / 2) / s.clock.period_ns).max(0);
+                st.skipped += ((wake - s.last_wake - period / 2) / period).max(0);
             }
             st.wait_called = now;
             if std::env::var_os("XRMIMIC_TRACE_FRAMES").is_some() {
@@ -997,7 +986,7 @@ pub unsafe extern "system" fn wait_frame(
             s.last_wake = wake;
             s.frames_waited += 1;
             let render = matches!(s.state, xr::SessionState::VISIBLE | xr::SessionState::FOCUSED);
-            (wake, s.clock.period_ns, render)
+            (wake, period, render)
         };
         time::sleep_until(wake);
         if let Some(s) = rt().sessions.get_mut(&session.into_raw()) {
@@ -1277,7 +1266,7 @@ pub unsafe extern "system" fn end_frame(session: xr::Session, info: *const xr::F
         s.gfx.submit(&eyes, &views, &quads, &depths, s.frames_shown);
         // Tests only: behave as if the user closed the headset window after N frames.
         if std::env::var("XRMIMIC_TEST_CLOSE_AFTER").ok().and_then(|v| v.parse::<u64>().ok()) == Some(n) {
-            s.gfx.shared.close_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+            s.headset.request_close();
         }
         xr::Result::SUCCESS
     })
@@ -1312,12 +1301,11 @@ pub unsafe extern "system" fn locate_views(
             return xr::Result::ERROR_HANDLE_INVALID;
         };
         // IPD and field of view follow the Device tab at once.
-        let device = crate::devstore::current();
-        let mut sim = s.sim.lock().unwrap();
-        sim.ipd = device.ipd;
-        for eye in 0..2 {
+        let device = headset::device();
+        let eyes = s.headset.eye_poses();
+        for (eye, pose) in eyes.iter().enumerate() {
             let v = &mut *views.add(eye);
-            v.pose = to_xr(&Pose::relative(&base, &sim.eye_pose(eye)));
+            v.pose = to_xr(&Pose::relative(&base, pose));
             v.fov = fov_xr(device.fov(eye));
         }
         (*state).view_state_flags = xr::ViewStateFlags::ORIENTATION_VALID

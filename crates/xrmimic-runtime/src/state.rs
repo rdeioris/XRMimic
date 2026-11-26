@@ -1,13 +1,12 @@
 //! The runtime's objects, behind one global lock.
 
 use crate::gfx::{SessionGfx, SwapchainData};
-use crate::headset::Window;
+use crate::headset::Headset;
 use openxr_sys as xr;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use xrmimic_core::math::Pose;
-use xrmimic_core::sim::{ControllerInput, SimState};
-use xrmimic_core::timing::FrameClock;
+use xrmimic_core::sim::ControllerInput;
 
 pub enum Event {
     SessionState { session: u64, state: xr::SessionState, time: i64 },
@@ -59,9 +58,8 @@ pub struct SessionData {
     pub running: bool,
     pub exit_requested: bool,
     pub gfx: SessionGfx,
-    pub sim: Arc<Mutex<SimState>>,
-    pub window: Option<Window>,
-    pub clock: FrameClock,
+    /// The simulated headset: device, user, frame clock, window (crate::headset).
+    pub headset: Box<dyn Headset>,
     pub last_wake: i64,
     pub frame_begun: bool,
     pub frames_waited: u64,
@@ -209,8 +207,8 @@ impl Runtime {
         self.spaces.retain(|_, s| s.session != session);
         self.swapchains.retain(|_, s| s.session != session);
         if let Some(mut s) = self.sessions.remove(&session) {
-            if let Some(w) = s.window.take() {
-                w.stop();
+            if let Some(stop) = s.headset.shutdown() {
+                stop();
             }
         }
     }

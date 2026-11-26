@@ -523,7 +523,11 @@ action refused), STAGE's bounds, and that a controller put down by itself
 
 - `crates/xrmimic-core`: platform-neutral math, device profile, frame pacing,
   simulated user and binding paths.
-- `crates/xrmimic-runtime`: the runtime DLL (OpenXR entry points, D3D11, window).
+- `crates/xrmimic-runtime`: the runtime DLL: the OpenXR entry points
+  (`api.rs`, `input.rs`, `handtrack.rs`), the graphics backends (`d3d.rs`,
+  `vk.rs`), and the simulated headset behind `headset.rs` (the simulated
+  user's thread, the window and its tabs). The OpenXR side reaches the
+  headset only through `headset.rs`.
 - `crates/xrmimic-launch`: the out-of-sandbox helper.
 - `crates/xrmimic-minimal`: the smallest runtime that only advertises itself.
 
