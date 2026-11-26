@@ -76,7 +76,12 @@ $env:XRMIMIC_SWITCH_DIR = $runtimeDir
 $chromeArgs = @(
     "--user-data-dir=`"$UserDataDir`"",
     "--no-first-run",
-    "--no-default-browser-check"
+    "--no-default-browser-check",
+    # WebXR through WebGPU (XRGPUBinding, e.g. renderia's XRDirect): Blink's
+    # experimental binding and the browser feature that gives WebGPU sessions
+    # their OpenXR swapchains. Both are off by default in Chrome 157.
+    "--enable-blink-features=WebXRGPUBinding",
+    "--enable-features=WebXRWebGPUBinding"
 )
 if ($NoSandbox) { $chromeArgs += "--no-sandbox" }
 

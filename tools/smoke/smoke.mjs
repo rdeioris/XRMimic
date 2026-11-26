@@ -86,11 +86,15 @@ const turnRate = 0.5; // rad/s of scripted head yaw (positive turns left)
 const env = {
   ...process.env,
   XR_RUNTIME_JSON: path.join(work, 'xrmimic.json'),
-  XRMIMIC_TEST_TURN: String(turnRate),
-  XRMIMIC_TEST_MOVE: '1', // walk forward at the default 1.4 m/s
+  // The smoke's own page: a scripted turn and walk (other pages: standing still).
+  ...(opt('--url') || opt('--eval-file') ? {} : {
+    XRMIMIC_TEST_TURN: String(turnRate),
+    XRMIMIC_TEST_MOVE: '1', // walk forward at the default 1.4 m/s
+  }),
   XRMIMIC_TEST_CONTROLLERS: '1',
-  // The second session is closed from the headset side after 120 frames.
-  XRMIMIC_TEST_CLOSE_AFTER: '120',
+  // The second session is closed from the headset side after 120 frames (only
+  // in the smoke's own sequence: probes and other pages run undisturbed).
+  ...(opt('--url') || opt('--eval-file') ? {} : { XRMIMIC_TEST_CLOSE_AFTER: '120' }),
   XRMIMIC_LOG: log,
   XRMIMIC_TRACE_FILE: path.join(work, 'trace.log'),
   ...(process.env.XRMIMIC_SMOKE_DEVICE ? { XRMIMIC_DEVICE_FILE: path.join(work, 'device.ini') } : {}),
@@ -101,7 +105,7 @@ const env = {
     XRMIMIC_TEST_SNAPSHOT: path.join(work, 'window.bmp'),
   } : {}),
   XRMIMIC_CAPTURE: bmp,
-  XRMIMIC_CAPTURE_FRAME: '60',
+  XRMIMIC_CAPTURE_FRAME: opt('--capture-frame', '60'),
 };
 const chromeArgs = [
   `--user-data-dir=${path.join(work, 'profile')}`,
@@ -110,6 +114,10 @@ const chromeArgs = [
   '--no-default-browser-check',
   // An off-screen window must still count as visible for requestSession.
   '--disable-features=Translate,CalculateNativeWinOcclusion',
+  // Windows: WebXR through WebGPU (XRGPUBinding), Blink's experimental binding
+  // and the browser feature that gives WebGPU sessions their OpenXR swapchains
+  // (untried on Linux; Chrome keeps only the last --enable-features).
+  ...(win ? ['--enable-blink-features=WebXRGPUBinding', '--enable-features=WebXRWebGPUBinding'] : []),
   ...(flag('--no-sandbox') ? ['--no-sandbox'] : []),
   // Linux: OpenXR is behind a feature flag (Chrome 157+); the box has no display.
   // Under a Wayland compositor (WAYLAND_DISPLAY set, e.g. headless GNOME Shell)
@@ -269,8 +277,11 @@ if (opt('--url') && opt('--click')) {
     return { state: 'done', frames };
   })()`);
 } else {
-  // 1: a normal session (ends itself at 100 frames, before the close hook).
-  result = await evaluate('startXR(100)');
+  // 1: a normal session (ends itself at 100 frames, before the close hook);
+  // --webgpu: drawn through XRGPUBinding instead of WebGL.
+  const webgpu = flag('--webgpu');
+  result = await evaluate(`startXR(100, ${webgpu})`);
+  if (webgpu && result?.errors?.length) fail(`WebGPU session: ${result.errors.join('; ')}`);
   // 2: the headset window "closes" mid-session; the page must see the end.
   const closed = await evaluate('startXR(100000)');
   console.log('closed session:', JSON.stringify({ state: closed?.state, frames: closed?.frames }));

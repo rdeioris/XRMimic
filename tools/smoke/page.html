@@ -3,20 +3,38 @@
 <title>XRMimic smoke</title>
 <p id="status">idle</p>
 <script>
-// Starts an immersive-vr session and clears the left eye red, the right eye green.
+// Starts an immersive-vr session and clears the left eye red, the right eye green,
+// through WebGL (XRWebGLLayer) or, with webgpu, WebGPU (XRGPUBinding).
 // The smoke driver calls startXR() with a user gesture through the DevTools protocol.
 window.xrResult = { state: 'idle' };
-async function startXR(frames = 240) {
-  const r = window.xrResult = { state: 'starting', frames: 0, views: 0, errors: [], requestedAt: performance.now() };
+async function startXR(frames = 240, webgpu = false) {
+  const r = window.xrResult = { state: 'starting', frames: 0, views: 0, errors: [], requestedAt: performance.now(), webgpu };
   try {
     r.supported = await navigator.xr.isSessionSupported('immersive-vr');
-    const session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] });
-    const canvas = document.createElement('canvas');
-    const gl = canvas.getContext('webgl2', { xrCompatible: true });
-    await gl.makeXRCompatible();
-    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
-    r.renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
-    session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+    let gl, device, binding, projection;
+    if (webgpu) {
+      if (typeof XRGPUBinding === 'undefined') throw new Error('no XRGPUBinding in this browser');
+      const adapter = await navigator.gpu.requestAdapter({ xrCompatible: true });
+      device = await adapter.requestDevice();
+      device.lost.then((i) => r.errors.push('device lost: ' + i.message));
+      device.addEventListener('uncapturederror', (e) => r.errors.push('webgpu: ' + e.error.message));
+    }
+    const session = await navigator.xr.requestSession('immersive-vr', webgpu
+      ? { requiredFeatures: ['webgpu'], optionalFeatures: ['local-floor'] }
+      : { optionalFeatures: ['local-floor'] });
+    if (webgpu) {
+      binding = new XRGPUBinding(session, device);
+      projection = binding.createProjectionLayer({ colorFormat: binding.getPreferredColorFormat() });
+      session.updateRenderState({ layers: [projection] });
+      r.renderer = 'WebGPU ' + binding.getPreferredColorFormat();
+    } else {
+      const canvas = document.createElement('canvas');
+      gl = canvas.getContext('webgl2', { xrCompatible: true });
+      await gl.makeXRCompatible();
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      r.renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+      session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+    }
     const space = await session.requestReferenceSpace('local-floor').catch(() => session.requestReferenceSpace('local'));
     r.state = 'running';
     await new Promise((resolve) => {
@@ -24,8 +42,10 @@ async function startXR(frames = 240) {
       const frame = (t, xrFrame) => {
         const pose = xrFrame.getViewerPose(space);
         const layer = session.renderState.baseLayer;
-        gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
-        gl.enable(gl.SCISSOR_TEST);
+        if (gl) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+          gl.enable(gl.SCISSOR_TEST);
+        }
         if (pose) {
           r.views = pose.views.length;
           r.viewerY = pose.transform.position.y;
@@ -53,13 +73,22 @@ async function startXR(frames = 240) {
             ray: !!xrFrame.getPose(src.targetRaySpace, space),
             grip: !!(src.gripSpace && xrFrame.getPose(src.gripSpace, space)),
           }));
+          const enc = device && device.createCommandEncoder();
           for (const view of pose.views) {
-            const vp = layer.getViewport(view);
-            gl.viewport(vp.x, vp.y, vp.width, vp.height);
-            gl.scissor(vp.x, vp.y, vp.width, vp.height);
-            if (view.eye === 'left') gl.clearColor(1, 0, 0, 1); else gl.clearColor(0, 1, 0, 1);
-            gl.clear(gl.COLOR_BUFFER_BIT);
+            const colour = view.eye === 'left' ? [1, 0, 0, 1] : [0, 1, 0, 1];
+            if (gl) {
+              const vp = layer.getViewport(view);
+              gl.viewport(vp.x, vp.y, vp.width, vp.height);
+              gl.scissor(vp.x, vp.y, vp.width, vp.height);
+              gl.clearColor(...colour);
+              gl.clear(gl.COLOR_BUFFER_BIT);
+            } else {
+              const sub = binding.getViewSubImage(projection, view);
+              const target = sub.colorTexture.createView(sub.getViewDescriptor());
+              enc.beginRenderPass({ colorAttachments: [{ view: target, loadOp: 'clear', storeOp: 'store', clearValue: colour }] }).end();
+            }
           }
+          if (enc) device.queue.submit([enc.finish()]);
         }
         r.frames++;
         if (r.frames === 1) r.firstFrameAt = performance.now();

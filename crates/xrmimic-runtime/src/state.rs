@@ -19,6 +19,8 @@ pub enum Event {
 pub struct InstanceData {
     pub events: VecDeque<Event>,
     pub app_name: String,
+    /// XrApplicationInfo::engineName ("Chromium" for Chrome and its kin).
+    pub engine: String,
     pub extensions: Vec<String>,
     /// Suggested bindings per interaction profile path: (action, binding path).
     pub suggested: HashMap<u64, Vec<(u64, u64)>>,

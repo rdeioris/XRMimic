@@ -320,6 +320,30 @@ What Chrome 157 asks of the runtime (logged by XRMimic):
 - Chrome's swapchain is single-sampled (WebXR antialiasing happens in the
   page's own framebuffer), so MSAA swapchains are for native apps.
 
+**WebXR through WebGPU** (`XRGPUBinding`, a WebGPU device drawing straight
+into the headset's layer). Chrome 157 has it on Windows, behind two switches
+the launcher and the smoke check pass:
+
+- `--enable-blink-features=WebXRGPUBinding` makes `XRGPUBinding` exist in the
+  page (an experimental Blink feature);
+- `--enable-features=WebXRWebGPUBinding` lets the browser give a session that
+  asks for `requiredFeatures: ['webgpu']` its OpenXR swapchain as a shared
+  image WebGPU can write (off by default; Chrome keeps only the last
+  `--enable-features`, so add others to the same list).
+
+The page asks for an adapter with `xrCompatible: true`, makes
+`new XRGPUBinding(session, device)`, a projection layer
+(`createProjectionLayer`, `bgra8unorm` preferred), and draws each view into
+`getViewSubImage(layer, view).colorTexture` (a 2-layer array, one layer per
+eye; `getViewDescriptor()` picks it). Chrome asks for an sRGB swapchain either
+way; XRMimic makes Chromium's sRGB images plain RGBA8 underneath, the one
+format both of Chrome's halves accept: its shared-image code refuses a typed
+sRGB texture (the XR process dies after the first `xrBeginFrame`) and Dawn a
+typeless one (the page's device is lost: "Unsupported DXGI format 1b"). The
+bytes are the same as before for WebGL sessions, which write sRGB-encoded
+values through linear views. `node tools/smoke/smoke.mjs --webgpu` checks the
+WebGPU path (red | green eyes, through `XRGPUBinding`).
+
 The runtime logs every entry point it is given and the first calls of each to
 `XRMIMIC_LOG` (the launcher prints where).
 
@@ -373,6 +397,18 @@ your desktop), and checks that:
 - closing the headset ends the session, and a new session starts after it;
 - a runtime-switch request from the sandboxed window reaches the helper
   (dry run: the registry is not touched).
+
+`--webgpu` draws the first session through WebGPU (`XRGPUBinding`) instead of
+WebGL. `--url <page> --click <selector>` drives someone else's page through
+its own Enter VR control instead (standing still: the scripted walk and the
+headset close are only for the smoke's page); `--read <expression>` prints
+what the page shows afterwards, `--run-ms` sets how long the session runs and
+`--capture-frame <n>` which frame `XRMIMIC_CAPTURE` keeps (`capture.bmp` in
+the work folder):
+
+```powershell
+node tools\smoke\smoke.mjs --url "https://rdeioris.github.io/renderia-furnish/?seed=5&furnish" --click "#vr" --run-ms 12000 --capture-frame 600 --read "document.getElementById('vr').title"
+```
 
 Quad layers are checked without a browser (Chrome 157 on Windows cannot send
 them) by a native OpenXR client that drives the runtime directly:

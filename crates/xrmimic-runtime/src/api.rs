@@ -174,7 +174,7 @@ pub unsafe extern "system" fn create_instance(
         let h = rt.new_handle();
         rt.instances.insert(
             h,
-            InstanceData { events: VecDeque::new(), app_name: app, extensions: exts, suggested: HashMap::new() },
+            InstanceData { events: VecDeque::new(), app_name: app, engine, extensions: exts, suggested: HashMap::new() },
         );
         *out = xr::Instance::from_raw(h);
         xr::Result::SUCCESS
@@ -481,11 +481,17 @@ pub unsafe extern "system" fn create_session(
         if std::env::var("XRMIMIC_HANDS").is_ok_and(|v| v == "1") {
             shared.hands.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        let gfx = match SessionGfx::from_session_create((*info).next, shared.clone()) {
+        #[allow(unused_mut)] // changed below on Windows only
+        let mut gfx = match SessionGfx::from_session_create((*info).next, shared.clone()) {
             Ok(g) => g,
             Err(e) => return e,
         };
         let mut rt = rt();
+        #[cfg(windows)]
+        {
+            gfx.srgb_as_unorm =
+                rt.instances.get(&instance.into_raw()).is_some_and(|i| i.engine == "Chromium");
+        }
         let app = rt.instances.get(&instance.into_raw()).map(|i| i.app_name.clone()).unwrap_or_default();
         *shared.app_name.lock().unwrap() = app;
         let device = crate::devstore::current();

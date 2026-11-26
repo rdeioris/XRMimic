@@ -261,6 +261,8 @@ pub struct SessionGfx {
     pub context: ID3D11DeviceContext,
     pub luid: LUID,
     pub shared: Arc<Shared>,
+    /// sRGB colour swapchains are made as typed UNORM textures (Chromium).
+    pub srgb_as_unorm: bool,
     compositor: Option<Compositor>,
     generation: u64,
     quad_rings: Vec<QuadRing>,
@@ -389,6 +391,7 @@ impl SessionGfx {
             context,
             luid,
             shared,
+            srgb_as_unorm: false,
             compositor: None,
             generation: 0,
             quad_rings: Vec::new(),
@@ -436,12 +439,23 @@ impl SessionGfx {
             bind |= D3D11_BIND_UNORDERED_ACCESS.0 as u32;
         }
         let cube_flag = if cube { D3D11_RESOURCE_MISC_TEXTURECUBE.0 as u32 } else { 0 };
+        // Chromium asks for sRGB but writes sRGB-encoded bytes through linear
+        // views, and its WebGPU sessions wrap the image as plain RGBA8: its
+        // shared-image code refuses a typed sRGB texture (the XR process dies)
+        // and Dawn a typeless one (the page's device is lost). A typed UNORM
+        // texture of the same family suits both, and the window still reads
+        // the frame as sRGB. Other apps get the format they asked for.
+        let texture_format = match format {
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB if self.srgb_as_unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB if self.srgb_as_unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
+            f => f,
+        };
         let mut desc = D3D11_TEXTURE2D_DESC {
             Width: ci.width,
             Height: ci.height,
             MipLevels: ci.mip_count.max(1),
             ArraySize: ci.array_size.max(1) * ci.face_count,
-            Format: format,
+            Format: texture_format,
             SampleDesc: DXGI_SAMPLE_DESC { Count: ci.sample_count.max(1), Quality: 0 },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: bind,
