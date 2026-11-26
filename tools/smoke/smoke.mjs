@@ -86,12 +86,14 @@ const turnRate = 0.5; // rad/s of scripted head yaw (positive turns left)
 const env = {
   ...process.env,
   XR_RUNTIME_JSON: path.join(work, 'xrmimic.json'),
-  // The smoke's own page: a scripted turn and walk (other pages: standing still).
+  // The smoke's own page: a scripted turn and walk, and held controller input
+  // (left stick pushed, grip squeezed; right trigger and A). Other pages and
+  // probes get a user standing still with the controllers at rest.
   ...(opt('--url') || opt('--eval-file') ? {} : {
     XRMIMIC_TEST_TURN: String(turnRate),
     XRMIMIC_TEST_MOVE: '1', // walk forward at the default 1.4 m/s
+    XRMIMIC_TEST_CONTROLLERS: '1',
   }),
-  XRMIMIC_TEST_CONTROLLERS: '1',
   // The second session is closed from the headset side after 120 frames (only
   // in the smoke's own sequence: probes and other pages run undisturbed).
   ...(opt('--url') || opt('--eval-file') ? {} : { XRMIMIC_TEST_CLOSE_AFTER: '120' }),
