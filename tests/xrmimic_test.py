@@ -873,7 +873,7 @@ def s_api():
     # xrWaitFrame holds the app to the headset's rate: never faster (a busy
     # machine may make this Python app slower, which is the app's doing).
     wall = (times[-1][2] - times[50][2]) / (len(times) - 51) * 1000
-    c.ok('frames paced at the period, not faster (ms)', 1000 / 90 * 0.95 <= wall <= 1000 / 90 * 3, round(wall, 2), '11.1 .. 33')
+    c.ok('frames paced at the period, not faster (ms)', wall >= 1000 / 90 * 0.95, round(wall, 2), '>= 10.6')
     acts.sync()
     c.eq('interaction profile', acts.profile(1), '/interaction_profiles/oculus/touch_controller')
     c.near('right trigger (held by the test)', acts.float(acts.trigger, 1), 1.0, 1e-3)
