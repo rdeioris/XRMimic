@@ -5,14 +5,18 @@
 //!   ... -- msaa       (4x MSAA eye swapchains, cleared to one colour each)
 //!   ... -- depth      (D32_SFLOAT depth per eye; checks the window's depth view)
 //!   ... -- depth16    (the same with D16_UNORM)
+//!   ... -- depth32s8  (D32_SFLOAT_S8_UINT, the right eye with finite reversed Z
+//!                      as Godot sends it: 4000 m at depth 0, 0.05 m at 1)
 //!
 //! It talks to the runtime directly (no loader) and makes its Vulkan instance
 //! and device through xrCreateVulkanInstanceKHR / xrCreateVulkanDeviceKHR.
 //! Each eye is a 256 x 256 swapchain painted by buffer copies: the left eye
 //! red over yellow, the right eye green over cyan (so a picture upside down
 //! or with the eyes swapped is caught), and a blue quad layer 0.6 m wide sits
-//! 1.5 m straight ahead. In `depth` modes the left eye's depth says 1 m
-//! (ordinary Z, 0.1..100 m) and the right eye's 4 m (reversed infinite Z).
+//! 1.5 m straight ahead. In `depth` modes each eye's depth runs from 1 m at
+//! the top row to 8 m at the bottom (uploaded row by row, so a copy that
+//! mixes up rows shows), the left eye with ordinary Z (0.1..100 m) and the
+//! right with reversed infinite Z.
 
 #[cfg(not(windows))]
 fn main() {
@@ -37,7 +41,8 @@ unsafe fn run() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     let msaa = args.iter().any(|a| a == "msaa");
     let depth16 = args.iter().any(|a| a == "depth16");
-    let depth_mode = depth16 || args.iter().any(|a| a == "depth");
+    let d32s8 = args.iter().any(|a| a == "depth32s8");
+    let depth_mode = depth16 || d32s8 || args.iter().any(|a| a == "depth");
     if depth_mode {
         std::env::set_var("XRMIMIC_TEST_DEPTH_VIEW", "1");
     }
@@ -264,7 +269,13 @@ unsafe fn run() -> i32 {
     let mut formats = vec![0i64; n as usize];
     check!(enum_formats(session, n, &mut n, formats.as_mut_ptr()));
     let colour = vk::Format::R8G8B8A8_UNORM;
-    let depth_format = if depth16 { vk::Format::D16_UNORM } else { vk::Format::D32_SFLOAT };
+    let depth_format = if depth16 {
+        vk::Format::D16_UNORM
+    } else if d32s8 {
+        vk::Format::D32_SFLOAT_S8_UINT
+    } else {
+        vk::Format::D32_SFLOAT
+    };
     for f in [colour, depth_format] {
         if !formats.contains(&(f.as_raw() as i64)) {
             eprintln!("FAIL: the runtime does not offer {f:?} (offers {formats:?})");
@@ -348,8 +359,32 @@ unsafe fn run() -> i32 {
         })
         .collect();
 
-    // Depth: the left eye at 1 m (0.1..100 m), the right at 4 m (reversed infinite).
-    let depth_eyes = [(0.1f32, 100.0f32, 1.0f32), (f32::INFINITY, 0.1, 4.0)];
+    // Depth: the left eye with ordinary Z (0.1..100 m), the right with
+    // reversed Z (infinite, or Godot's finite 4000..0.05 m); both from 1 m at
+    // the top row to 8 m at the bottom.
+    let depth_eyes = [(0.1f32, 100.0f32), if d32s8 { (4000.0f32, 0.05f32) } else { (f32::INFINITY, 0.1) }];
+    let row_metres = |y: f32| 1.0 + 7.0 * y / (EYE - 1) as f32;
+    let depth_pictures: Vec<vk::Buffer> = if depth_mode {
+        depth_eyes
+            .iter()
+            .map(|&(near, far)| {
+                let mut bytes = Vec::new();
+                for y in 0..EYE {
+                    let z = depth_value(row_metres(y as f32), 0.0, 1.0, near, far);
+                    for _ in 0..EYE {
+                        if depth16 {
+                            bytes.extend_from_slice(&((z * 65535.0).round() as u16).to_le_bytes());
+                        } else {
+                            bytes.extend_from_slice(&z.to_le_bytes());
+                        }
+                    }
+                }
+                host(&bytes)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let colour_range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -358,7 +393,10 @@ unsafe fn run() -> i32 {
         base_array_layer: 0,
         layer_count: 1,
     };
-    let depth_range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::DEPTH, ..colour_range };
+    // Layout changes take both aspects of a depth/stencil image.
+    let depth_aspects =
+        if d32s8 { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
+    let depth_range = vk::ImageSubresourceRange { aspect_mask: depth_aspects, ..colour_range };
     let to = |image, range, from: vk::ImageLayout, to: vk::ImageLayout| {
         vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -453,11 +491,22 @@ unsafe fn run() -> i32 {
         }
         for (e, (_, imgs)) in depths.iter().enumerate() {
             let img = imgs[depth_idx[e]];
-            let (near, far, metres) = depth_eyes[e];
-            let z = depth_value(metres, 0.0, 1.0, near, far);
             let ds = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             barrier(to(img, depth_range, ds, dst));
-            device.cmd_clear_depth_stencil_image(cmd, img, dst, &vk::ClearDepthStencilValue { depth: z, stencil: 0 }, &[depth_range]);
+            let region = vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D::default(),
+                image_extent: vk::Extent3D { width: EYE, height: EYE, depth: 1 },
+            };
+            device.cmd_copy_buffer_to_image(cmd, depth_pictures[e], img, dst, &[region]);
             barrier(to(img, depth_range, dst, ds));
         }
         let qimg = quad.1[quad_idx];
@@ -573,9 +622,10 @@ unsafe fn run() -> i32 {
     let side = ["left", "right"];
     for e in 0..2 {
         if depth_mode {
-            let g = (depth_shade(depth_eyes[e].2) * 255.0).round() as u8;
-            for (fx, fy) in [(0.5f32, 0.5f32), (0.15, 0.2), (0.85, 0.85)] {
-                expect(format!("{} eye depth, {} m, at ({fx}, {fy})", side[e], depth_eyes[e].2), at(e, fx, fy), [g, g, g]);
+            for (fx, fy) in [(0.5f32, 0.1f32), (0.15, 0.3), (0.5, 0.5), (0.85, 0.7), (0.3, 0.9)] {
+                let metres = row_metres(fy * EYE as f32 - 0.5);
+                let g = (depth_shade(metres) * 255.0).round() as u8;
+                expect(format!("{} eye depth, {metres:.2} m, at ({fx}, {fy})", side[e]), at(e, fx, fy), [g, g, g]);
             }
         } else if msaa {
             expect(format!("{} eye (MSAA, resolved)", side[e]), at(e, 0.15, 0.15), patterns[e].0);

@@ -503,7 +503,8 @@ run against it.
   `D24_UNORM_S8_UINT` and MSAA depth swapchains are not offered yet.
 - `cargo run --release -p xrmimic-runtime --example vk_client` is a small
   Vulkan client. With `XRMIMIC_TEST_SNAPSHOT=<out.bmp>` it checks the window's
-  picture: `-- msaa`, `-- depth` and `-- depth16` cover MSAA eyes and the
+  picture: `-- msaa`, `-- depth`, `-- depth16` and `-- depth32s8` (finite
+  reversed Z, as Godot sends it) cover MSAA eyes and the
   Depth view.
 
 ## Tests

@@ -1220,6 +1220,15 @@ pub unsafe extern "system" fn end_frame(session: xr::Session, info: *const xr::F
                     return xr::Result::ERROR_LAYER_INVALID;
                 };
                 let Some(base) = space_pose(&rt, space.into_raw()) else {
+                    if !rt.spaces.contains_key(&space.into_raw()) {
+                        let kind = match shape {
+                            crate::shared::Shape::Quad { .. } => "quad",
+                            crate::shared::Shape::Cylinder { .. } => "cylinder",
+                            crate::shared::Shape::Cube => "cube",
+                            _ => "equirect",
+                        };
+                        layer_dropped(kind, &format!("its space {space:?} is not a space of this session"));
+                    }
                     continue; // its space is not located right now: not shown
                 };
                 use crate::shared::Blend;
