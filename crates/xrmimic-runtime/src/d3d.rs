@@ -276,9 +276,6 @@ pub struct SessionGfx {
     pub shared: Arc<Shared>,
     /// sRGB colour swapchains are made as typed UNORM textures (Chromium).
     pub srgb_as_unorm: bool,
-    /// The app's depth images are upside down relative to its colour (Unity
-    /// on D3D11): they are read flipped, so the views that use depth line up.
-    pub depth_flipped: bool,
     compositor: Option<Compositor>,
     generation: u64,
     quad_rings: Vec<QuadRing>,
@@ -433,7 +430,6 @@ impl SessionGfx {
             luid,
             shared,
             srgb_as_unorm: false,
-            depth_flipped: false,
             compositor: None,
             generation: 0,
             quad_rings: Vec::new(),
@@ -802,7 +798,7 @@ impl SessionGfx {
             }]));
             c.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             c.VSSetShader(&r.vs, None);
-            let shader = match (ms, self.depth_flipped) {
+            let shader = match (ms, self.depth_flipped()) {
                 (true, false) => &r.ps,
                 (false, false) => &r.ps1,
                 (true, true) => &r.ps_flip,
@@ -820,6 +816,13 @@ impl SessionGfx {
         Some(())
     }
 
+    /// The app's depth images are upside down relative to its colour: they
+    /// are read flipped, so the views that use depth line up. Set at session
+    /// start and turned over by the window's check (crate::depthcheck).
+    fn depth_flipped(&self) -> bool {
+        self.shared.depth_flip.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Copy the eyes of the projection layer and each quad layer's image into
     /// the shared textures, signal the fence, and tell the window where things are.
     pub fn submit(
@@ -833,7 +836,7 @@ impl SessionGfx {
         if eyes.is_empty() {
             return;
         }
-        let flipped = self.depth_flipped;
+        let flipped = self.depth_flipped();
         // Depth rings: typeless textures the size of the app's whole depth
         // image (a depth copy must take the whole subresource).
         // MSAA depth images: sample 0 drawn into R32_FLOAT rings instead.

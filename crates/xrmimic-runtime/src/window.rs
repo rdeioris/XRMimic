@@ -1209,6 +1209,8 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
         )?;
         let depth_cb = depth_cb.unwrap();
         let mut opened_depth: Vec<Option<OpenedQuad>> = Vec::new();
+        // Which way up the app's depth is (crate::depthwatch), made on first use.
+        let mut depth_watch: Option<Option<crate::depthwatch::DepthWatch>> = None;
         let mut qvs = None;
         let mut qps = None;
         device.CreateVertexShader(&qvs_code, None, Some(&mut qvs))?;
@@ -1560,6 +1562,26 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
                     // GPU-side wait for the app's copy into this slot; the CPU
                     // and the app carry on.
                     let _ = context4.Wait(&o.fence, latest_value);
+                    // Is the app's depth upside down against its colour? Turn it
+                    // over if the pictures say so (unless XRMIMIC_DEPTH_FLIP fixed it).
+                    if shared.depth_flip_auto.load(Ordering::Relaxed) {
+                        let eye = |e: usize| {
+                            depth.iter().enumerate().find_map(|(i, d)| {
+                                let od = opened_depth.get(i)?.as_ref()?;
+                                (d.eye == e).then(|| (od.srvs[latest % od.srvs.len()].clone(), d))
+                            })
+                        };
+                        if let (Some((s0, d0)), Some((s1, d1)), Some(smp)) = (eye(0), eye(1), sampler.as_ref()) {
+                            let watch = depth_watch.get_or_insert_with(|| crate::depthwatch::DepthWatch::new(&device));
+                            if let Some(w) = watch.as_mut() {
+                                use crate::depthwatch::EyeDepth;
+                                let eyes = [EyeDepth { srv: &s0, slot: d0 }, EyeDepth { srv: &s1, slot: d1 }];
+                                if w.tick(&context, smp, &o.srvs[latest % o.srvs.len()], eyes) {
+                                    shared.depth_flip.fetch_xor(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
                     context.OMSetRenderTargets(Some(&[Some(draw_rtv.clone())]), None);
                     context.RSSetViewports(Some(&[vp]));
                     context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1805,7 +1827,9 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
                 if frames > 0 && snapshot_at.is_none() {
                     snapshot_at = Some(Instant::now());
                 }
-                if snapshot_at.is_some_and(|t| t.elapsed().as_secs_f32() > 0.8) {
+                // XRMIMIC_TEST_SNAPSHOT_DELAY: seconds after the first frame (0.8).
+                let delay = std::env::var("XRMIMIC_TEST_SNAPSHOT_DELAY").ok().and_then(|v| v.parse().ok()).unwrap_or(0.8f32);
+                if snapshot_at.is_some_and(|t| t.elapsed().as_secs_f32() > delay) {
                     match snapshot_window(hwnd, path) {
                         Ok(()) => xlog!("window snapshot written to {}", path.display()),
                         Err(e) => xlog!("window snapshot failed: {e}"),

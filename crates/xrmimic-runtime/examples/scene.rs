@@ -37,6 +37,15 @@
 //! a controller put down by itself stays put while the head walks towards the
 //! boundary (which the window then shows).
 //!
+//! Depth upside down: `flipdepth` sends the depth image upside down against
+//! the colour (as Unity's URP does through an intermediate texture);
+//! XRMimic's depth check must notice and turn it over.
+//!
+//!   XRMIMIC_TEST_SNAPSHOT=<out.bmp> cargo run ... --example scene -- depthview [flipdepth]
+//!
+//! photographs the window's Depth view after 4 s and checks the floor (near,
+//! bright) is at the bottom and the sky (far, dark) at the top.
+//!
 //! With XRMIMIC_TEST_SNAPSHOT (still scene, centre view on) it afterwards renders
 //! the same scene from a real camera between the eyes and compares it with the
 //! window's centre view, which only had the two eye images (and their depth):
@@ -112,6 +121,15 @@ unsafe fn run() -> i32 {
     let input_mode = args.iter().any(|a| a == "input");
     let hands_mode = args.iter().any(|a| a == "hands");
     let features_mode = args.iter().any(|a| a == "features");
+    let flip_depth = args.iter().any(|a| a == "flipdepth");
+    let depth_view_mode = args.iter().any(|a| a == "depthview");
+    if depth_view_mode {
+        std::env::set_var("XRMIMIC_TEST_DEPTH_VIEW", "1");
+        // Time for the depth check to look and turn the depth over.
+        if std::env::var_os("XRMIMIC_TEST_SNAPSHOT_DELAY").is_none() {
+            std::env::set_var("XRMIMIC_TEST_SNAPSHOT_DELAY", "4");
+        }
+    }
     // Where the features test puts the right controller (STAGE).
     const PUT: [f32; 3] = [0.3, 1.0, -0.5];
     if features_mode {
@@ -133,7 +151,7 @@ unsafe fn run() -> i32 {
         std::env::set_var("XRMIMIC_TEST_TAB", "input");
     } else if features_mode {
         std::env::set_var("XRMIMIC_TEST_TAB", "input");
-    } else if args.iter().any(|a| a == "centre") || snapshot.is_some() {
+    } else if !depth_view_mode && (args.iter().any(|a| a == "centre") || snapshot.is_some()) {
         std::env::set_var("XRMIMIC_TEST_CENTRE_VIEW", "1");
     }
     if let Some(s) = &snapshot {
@@ -675,6 +693,34 @@ unsafe fn run() -> i32 {
             v.unwrap()
         })
         .collect();
+    // flipdepth: the colour is drawn with a depth buffer of its own, and the
+    // depth image the runtime gets is drawn again, upside down, with a colour
+    // target of its own.
+    let scratch = flip_depth.then(|| {
+        let make_tex = |format: DXGI_FORMAT, bind: u32| {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: eye_w * 2,
+                Height: eye_h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: bind,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut t = None;
+            device.CreateTexture2D(&desc, None, Some(&mut t)).unwrap();
+            t.unwrap()
+        };
+        let c = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET.0 as u32);
+        let d = make_tex(DXGI_FORMAT_D32_FLOAT, D3D11_BIND_DEPTH_STENCIL.0 as u32);
+        let (mut rtv, mut dsv) = (None, None);
+        device.CreateRenderTargetView(&c, None, Some(&mut rtv)).unwrap();
+        device.CreateDepthStencilView(&d, None, Some(&mut dsv)).unwrap();
+        (rtv.unwrap(), dsv.unwrap())
+    });
     let acquire_wait = |sc: xr::Swapchain| -> usize {
         let mut idx = 0;
         check!(acquire(sc, std::ptr::null(), &mut idx));
@@ -855,7 +901,21 @@ unsafe fn run() -> i32 {
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             };
-            draw(&view_proj(pose, *fov), &insts, &rtvs[ci], &dsvs[di], viewport);
+            let vp = view_proj(pose, *fov);
+            if let Some((scratch_rtv, scratch_dsv)) = &scratch {
+                if e == 0 {
+                    context.ClearDepthStencilView(scratch_dsv, D3D11_CLEAR_DEPTH.0 as u32, 1.0, 0);
+                }
+                draw(&vp, &insts, &rtvs[ci], scratch_dsv, viewport);
+                // Clip-space y negated: the eye's depth drawn upside down.
+                let mut flipped = vp;
+                for k in [1, 5, 9, 13] {
+                    flipped[k] = -flipped[k];
+                }
+                draw(&flipped, &insts, scratch_rtv, &dsvs[di], viewport);
+            } else {
+                draw(&vp, &insts, &rtvs[ci], &dsvs[di], viewport);
+            }
         }
         context.OMSetRenderTargets(None, None);
         check!(release(color_sc, std::ptr::null()));
@@ -1006,6 +1066,52 @@ unsafe fn run() -> i32 {
             println!("{} {what}: app read {got}, want {want}", if *good { "ok  " } else { "FAIL" });
             ok &= good;
         }
+        println!("{}", if ok { "PASS" } else { "FAIL" });
+        return if ok { 0 } else { 1 };
+    }
+
+    // ------------------------------------------------ the Depth view: which way up
+    if depth_view_mode {
+        let Some(snapshot) = &snapshot else { return 0 };
+        let Ok(b) = std::fs::read(snapshot) else {
+            eprintln!("FAIL: no window snapshot at {}", snapshot.display());
+            return 1;
+        };
+        let w = i32::from_le_bytes(b[18..22].try_into().unwrap());
+        let h = -i32::from_le_bytes(b[22..26].try_into().unwrap());
+        let grey = |x: i32, y: i32| {
+            let o = 54 + ((y * w + x) * 4) as usize;
+            b[o + 1] as f32
+        };
+        // Both eyes side by side under the 34 px toolbar, letterboxed.
+        let aspect = (eye_w * 2) as f32 / eye_h as f32;
+        let (vw0, vh0) = (w as f32, (h - 34) as f32);
+        let (mut vw, mut vh) = (vw0, vw0 / aspect);
+        if vh > vh0 {
+            vh = vh0;
+            vw = vh0 * aspect;
+        }
+        let (x0, y0) = ((vw0 - vw) * 0.5, 34.0 + (vh0 - vh) * 0.5);
+        // Mean grey of a band of rows (fractions of the view's height), both eyes.
+        let band = |a: f32, b: f32| {
+            let (mut sum, mut n) = (0.0, 0.0);
+            for yi in 0..20 {
+                let y = (y0 + vh * (a + (b - a) * yi as f32 / 19.0)) as i32;
+                for xi in 0..60 {
+                    let x = (x0 + vw * (0.02 + 0.96 * xi as f32 / 59.0)) as i32;
+                    sum += grey(x, y);
+                    n += 1.0;
+                }
+            }
+            sum / n
+        };
+        let (top, bottom) = (band(0.03, 0.2), band(0.8, 0.97));
+        let ok = bottom > top + 30.0;
+        println!(
+            "{} depth view {}: floor at the bottom (mean grey {bottom:.0}) nearer than the sky at the top ({top:.0})",
+            if ok { "ok  " } else { "FAIL" },
+            if flip_depth { "(depth sent upside down)" } else { "(depth sent upright)" }
+        );
         println!("{}", if ok { "PASS" } else { "FAIL" });
         return if ok { 0 } else { 1 };
     }

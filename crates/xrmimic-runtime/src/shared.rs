@@ -78,6 +78,13 @@ pub struct Shared {
     pub tab_input: Mutex<[xrmimic_core::sim::ControllerInput; 2]>,
     /// The user put the controllers down and uses tracked hands.
     pub hands: AtomicBool,
+    /// The app's depth images are read upside down (relative to its colour).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub depth_flip: AtomicBool,
+    /// The window may turn depth_flip over when the pictures say so
+    /// (crate::depthwatch); off when XRMIMIC_DEPTH_FLIP fixes it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub depth_flip_auto: AtomicBool,
     /// Haptic feedback the app sent each hand (xrApplyHapticFeedback).
     pub haptics: Mutex<[xrmimic_core::haptics::HapticState; 2]>,
     /// The app has attached its action sets.

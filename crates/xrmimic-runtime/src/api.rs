@@ -491,18 +491,26 @@ pub unsafe extern "system" fn create_session(
         {
             gfx.srgb_as_unorm =
                 rt.instances.get(&instance.into_raw()).is_some_and(|i| i.engine == "Chromium");
-            // Unity on D3D11 (URP, single- and multi-pass, OpenXR plugin 1.17)
-            // submits depth upside down relative to its colour: read it flipped.
-            // XRMIMIC_DEPTH_FLIP=0 or 1 overrides the guess for any app.
+            // Depth upside down relative to colour: Unity's URP sends it so on
+            // D3D11 whenever it renders through an intermediate texture, so
+            // Unity starts flipped; the window then checks the pictures and
+            // turns it over if they disagree (crate::depthcheck).
+            // XRMIMIC_DEPTH_FLIP=0 or 1 fixes it for any app (no checking);
+            // "detect" starts upright and checks.
             let unity = rt.instances.get(&instance.into_raw()).is_some_and(|i| i.engine == "Unity");
-            gfx.depth_flipped = match std::env::var("XRMIMIC_DEPTH_FLIP").as_deref() {
-                Ok("1") => true,
-                Ok("0") => false,
-                _ => unity,
+            let (flip, auto) = match std::env::var("XRMIMIC_DEPTH_FLIP").as_deref() {
+                Ok("1") => (true, false),
+                Ok("0") => (false, false),
+                Ok("detect") => (false, true),
+                _ => (unity, true),
             };
-            if gfx.depth_flipped {
-                xlog!("depth images are read upside down (engine Unity, or XRMIMIC_DEPTH_FLIP=1)");
-            }
+            gfx.shared.depth_flip.store(flip, std::sync::atomic::Ordering::Relaxed);
+            gfx.shared.depth_flip_auto.store(auto, std::sync::atomic::Ordering::Relaxed);
+            xlog!(
+                "depth images read {}{}",
+                if flip { "upside down" } else { "upright" },
+                if auto { ", checked against the colour" } else { " (XRMIMIC_DEPTH_FLIP)" }
+            );
         }
         let app = rt.instances.get(&instance.into_raw()).map(|i| i.app_name.clone()).unwrap_or_default();
         *shared.app_name.lock().unwrap() = app;

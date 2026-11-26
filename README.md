@@ -104,11 +104,26 @@ picture, when the app sends one with its projection layer
 at the eye, mid grey at 2 m, darker further away. Ordinary, reversed and
 infinite depth ranges are read as the app declares them. Neither Chrome 157
 (Windows) nor Chrome 158 (Linux) enables the extension, so only native OpenXR
-apps fill it. Unity on D3D11 (its OpenXR plugin with URP) submits depth
-upside down relative to its colour; XRMimic reads it flipped for apps whose
-engine is "Unity", so the Depth, Centre and Reproject views and depth-tested
-layers line up (the log says so). `XRMIMIC_DEPTH_FLIP=1` or `0` forces it on or
-off for any app.
+apps fill it.
+
+**Depth the wrong way up.** Some apps send depth upside down relative to
+their colour: Unity's URP does on D3D11 whenever it renders through an
+intermediate texture (its XR depth copy, `CopyDepthPass.hlsl`, loads the
+source at the destination's pixel and so drops the vertical flip its colour
+copy applies; a Unity app rendering straight into the swapchains sends
+upright depth). XRMimic checks which way up each app's depth is: a few
+times a second the window samples both eyes' colour and depth on a 64 x 64
+grid and asks, both ways up, how likely the colour edge at a depth jump (an
+object's outline) is to be stronger than where the depth is quiet. The right
+way up scores well above 0.5, the wrong way about 0.5, even with busy
+textures; three clear votes in a row turn the depth over, and the Depth,
+Centre and Reproject views and depth-tested layers line up from the next
+frame. Flat pictures (a wall, an empty sky) give no verdict and change
+nothing. Apps whose engine is "Unity" start upside down, others upright;
+the log shows the scores and any turn. `XRMIMIC_DEPTH_FLIP=1` or `0` fixes it
+for an app (no checking), `detect` starts upright and checks.
+`XRMIMIC_DEPTH_CHECK_DUMP=<file>` saves the first check's grids (per eye:
+64 x 64 luminance, then 64 x 64 log distance, f32), for study.
 
 **Centre** (toolbar checkbox): one undistorted picture from a camera halfway
 between the eyes instead of the two eye images, for screenshots, recordings
@@ -463,6 +478,11 @@ them now (with depth) or leave them (rotation only). `-- depthtest` depth-tests
 the yellow and red quad 1.5 m ahead: hidden behind the left eye's 1 m, shown in
 front of the right eye's 4 m. `msaa` added to any mode makes every swapchain
 but the cube map 4x MSAA, colour and depth, and the same checks must pass.
+
+The scene's `-- depthview [flipdepth]` test photographs the Depth view after
+4 s (`XRMIMIC_TEST_SNAPSHOT_DELAY`) and checks the floor (near) is at the
+bottom and the sky (far) at the top; `flipdepth` sends the depth upside down,
+so it passes only if the depth check turned it over.
 
 The scene's `-- features` test (`XRMIMIC_TEST_SNAPSHOT=<out.bmp> ... --example
 scene -- features`) checks haptics (a pulse, a stop, a pulse on an input

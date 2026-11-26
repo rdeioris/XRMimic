@@ -2,6 +2,7 @@
 //! and the simulated user.
 
 pub mod bindings;
+pub mod depthcheck;
 pub mod device;
 pub mod hands;
 pub mod haptics;

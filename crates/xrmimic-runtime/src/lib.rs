@@ -38,6 +38,8 @@ mod logview;
 #[cfg(windows)]
 mod window;
 #[cfg(windows)]
+mod depthwatch;
+#[cfg(windows)]
 use window as headset;
 #[cfg(target_os = "linux")]
 mod headless;

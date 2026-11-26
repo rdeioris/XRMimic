@@ -20,6 +20,7 @@ pub struct InstanceData {
     pub events: VecDeque<Event>,
     pub app_name: String,
     /// XrApplicationInfo::engineName ("Chromium" for Chrome and its kin).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub engine: String,
     pub extensions: Vec<String>,
     /// Suggested bindings per interaction profile path: (action, binding path).
