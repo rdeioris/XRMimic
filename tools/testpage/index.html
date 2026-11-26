@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XRMimic test page</title>
+<style>
+  :root { --bg: #f7f6f2; --fg: #1d1d1b; --muted: #6f6e69; --line: #dcd9d1; --card: #fff; --accent: #1f5fbf; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #17181a; --fg: #e9e8e4; --muted: #a2a19b; --line: #34353a; --card: #202125; --accent: #79a8ff; }
+  }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.lead { margin: 0 0 16px; color: var(--muted); }
+  .bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px; }
+  button { font: inherit; padding: 8px 18px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { color: var(--muted); }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 16px; padding: 8px 12px 10px; }
+  legend { color: var(--muted); padding: 0 6px; }
+  fieldset label { display: inline-flex; gap: 6px; align-items: center; margin: 4px 16px 4px 0; font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .card h2 { font-size: 14px; margin: 0 0 8px; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; font-size: 13px; }
+  .kv span:nth-child(odd) { color: var(--muted); }
+  code, .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  .yes { color: #2e7d32; } .no { color: #b3261e; }
+  @media (prefers-color-scheme: dark) { .yes { color: #7bd27f; } .no { color: #ff8a80; } }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  td, th { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+</style>
+</head>
+<body>
+<main>
+  <h1>XRMimic test page</h1>
+  <p class="lead">Starts an <code>immersive-vr</code> session and shows what WebXR tells this page about the headset:
+    the features granted, the detected headset, the controllers, and whether layers work.</p>
+  <div class="bar">
+    <button id="enter" disabled>Enter VR</button>
+    <span id="status">Checking WebXR…</span>
+  </div>
+  <fieldset id="features"><legend>Optional features to request</legend></fieldset>
+  <div class="grid">
+    <section class="card"><h2>Session</h2><div class="kv" id="session"><span>state</span><span>not started</span></div></section>
+    <section class="card"><h2>Headset (as WebXR sees it)</h2><div class="kv" id="headset"><span>—</span><span></span></div></section>
+    <section class="card"><h2>Layers</h2><div class="kv" id="layers"><span>—</span><span></span></div></section>
+    <section class="card" style="grid-column: 1 / -1"><h2>Controllers</h2><div id="controllers" class="mono">—</div></section>
+  </div>
+</main>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

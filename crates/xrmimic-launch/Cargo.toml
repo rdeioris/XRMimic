@@ -1,0 +1,13 @@
+[package]
+name = "xrmimic-launch"
+description = "Helpers for xrmimic that run outside Chrome's sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xrmimic-runtime = { path = "../xrmimic-runtime" }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = ["Win32_Foundation", "Win32_System_Threading"]

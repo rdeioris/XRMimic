@@ -1,0 +1,86 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>XRMimic smoke</title>
+<p id="status">idle</p>
+<script>
+// Starts an immersive-vr session and clears the left eye red, the right eye green.
+// The smoke driver calls startXR() with a user gesture through the DevTools protocol.
+window.xrResult = { state: 'idle' };
+async function startXR(frames = 240) {
+  const r = window.xrResult = { state: 'starting', frames: 0, views: 0, errors: [], requestedAt: performance.now() };
+  try {
+    r.supported = await navigator.xr.isSessionSupported('immersive-vr');
+    const session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] });
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl2', { xrCompatible: true });
+    await gl.makeXRCompatible();
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    r.renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+    const space = await session.requestReferenceSpace('local-floor').catch(() => session.requestReferenceSpace('local'));
+    r.state = 'running';
+    await new Promise((resolve) => {
+      session.addEventListener('end', () => { r.endedByRuntime = r.state !== 'finishing'; resolve(); });
+      const frame = (t, xrFrame) => {
+        const pose = xrFrame.getViewerPose(space);
+        const layer = session.renderState.baseLayer;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+        gl.enable(gl.SCISSOR_TEST);
+        if (pose) {
+          r.views = pose.views.length;
+          r.viewerY = pose.transform.position.y;
+          // Yaw of the viewer's forward (-Z) direction; sum frame-to-frame steps so wrapping is harmless.
+          const q = pose.transform.orientation;
+          const fx = -2 * (q.x * q.z + q.w * q.y), fz = -(1 - 2 * (q.x * q.x + q.y * q.y));
+          const yaw = Math.atan2(-fx, -fz);
+          if (r.lastYaw !== undefined) {
+            let d = yaw - r.lastYaw;
+            if (d > Math.PI) d -= 2 * Math.PI;
+            if (d < -Math.PI) d += 2 * Math.PI;
+            // Turn and walk are measured from frame 40 on, against the time since
+            // then: the headset window's start-up does not skew them either way.
+            if (r.frames > 40) r.yawTurned = (r.yawTurned || 0) + d;
+          }
+          r.lastYaw = yaw;
+          const p = pose.transform.position;
+          if (r.lastPos && r.frames > 40) r.walked = (r.walked || 0) + Math.hypot(p.x - r.lastPos.x, p.z - r.lastPos.z);
+          r.lastPos = { x: p.x, y: p.y, z: p.z };
+          r.inputs = [...session.inputSources].map((src) => ({
+            hand: src.handedness,
+            profiles: src.profiles,
+            buttons: src.gamepad ? [...src.gamepad.buttons].map((b) => +b.value.toFixed(2)) : null,
+            axes: src.gamepad ? [...src.gamepad.axes].map((a) => +a.toFixed(2)) : null,
+            ray: !!xrFrame.getPose(src.targetRaySpace, space),
+            grip: !!(src.gripSpace && xrFrame.getPose(src.gripSpace, space)),
+          }));
+          for (const view of pose.views) {
+            const vp = layer.getViewport(view);
+            gl.viewport(vp.x, vp.y, vp.width, vp.height);
+            gl.scissor(vp.x, vp.y, vp.width, vp.height);
+            if (view.eye === 'left') gl.clearColor(1, 0, 0, 1); else gl.clearColor(0, 1, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+          }
+        }
+        r.frames++;
+        if (r.frames === 1) r.firstFrameAt = performance.now();
+        if (r.frames === 41) r.measureFrom = performance.now();
+        if (r.frames >= frames) { r.lastFrameAt = performance.now(); r.state = 'finishing'; resolve(); return; }
+        session.requestAnimationFrame(frame);
+      };
+      session.requestAnimationFrame(frame);
+    });
+    if (r.endedByRuntime) {
+      r.state = 'ended-by-runtime';
+    } else {
+      r.fps = (r.frames - 1) * 1000 / (r.lastFrameAt - r.firstFrameAt);
+      await session.end();
+      r.state = 'done';
+    }
+  } catch (e) {
+    r.state = 'error';
+    r.errors.push(String(e));
+  }
+  document.getElementById('status').textContent = JSON.stringify(r);
+  return r;
+}
+</script>

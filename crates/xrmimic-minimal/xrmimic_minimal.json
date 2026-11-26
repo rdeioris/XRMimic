@@ -1,0 +1,7 @@
+{
+    "file_format_version": "1.0.0",
+    "runtime": {
+        "name": "XRMimic minimal",
+        "library_path": "../../target/release/xrmimic_minimal.dll"
+    }
+}

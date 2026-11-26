@@ -1,0 +1,12 @@
+[package]
+name = "xrmimic-minimal"
+description = "The smallest OpenXR runtime: it only advertises itself"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+openxr-sys = "0.14"
