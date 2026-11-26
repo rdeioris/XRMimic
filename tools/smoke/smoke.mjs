@@ -40,6 +40,9 @@ const fail = (msg) => { console.error(`FAIL: ${msg}`); finish(1); };
 
 let browser;
 let server;
+// --server (Windows): the headset runs in xrmimic-server, started here.
+let headsetServer;
+const serverLog = path.join(work, 'server.log');
 function finish(code) {
   if (browser && !flag('--keep') && !win) {
     // Chrome was started as its own process group: end the whole group.
@@ -57,8 +60,12 @@ function finish(code) {
       }
     } catch {}
   }
+  if (headsetServer) {
+    try { execFileSync('taskkill', ['/PID', String(headsetServer.pid), '/F'], { stdio: 'ignore' }); } catch {}
+  }
   server?.close();
   console.log(`log: ${log}`);
+  if (headsetServer) console.log(`server log: ${serverLog}`);
   process.exit(code);
 }
 
@@ -137,6 +144,14 @@ const chromeArgs = [
 // --chrome-log: Chrome's own log (stderr) into the work folder.
 const chromeLog = flag('--chrome-log') ? fs.openSync(path.join(work, 'chrome.log'), 'w') : 'ignore';
 if (flag('--chrome-log')) chromeArgs.splice(1, 0, '--enable-logging=stderr', '--v=0', '--vmodule=*openxr*=2,*xr*=1');
+if (win && flag('--server')) {
+  env.XRMIMIC_SERVER = 'local';
+  env.XRMIMIC_SERVER_PIPE = `xrmimic-smoke-${process.pid}`;
+  headsetServer = spawn(path.join(root, 'target', 'release', 'xrmimic-server.exe'), [], {
+    env: { ...env, XRMIMIC_LOG: serverLog },
+    stdio: 'ignore',
+  });
+}
 browser = spawn(chrome, chromeArgs, { env, stdio: ['ignore', chromeLog, chromeLog], detached: !win });
 if (win) {
   // The switch helper, outside the sandbox, in dry-run mode (no UAC, no registry).
@@ -298,7 +313,8 @@ if (!result || result.state !== 'done') fail(`session did not complete: ${JSON.s
 
 // 4. What the runtime saw.
 await new Promise((r) => setTimeout(r, 500));
-const text = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '';
+const text = (fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '')
+  + (headsetServer && fs.existsSync(serverLog) ? fs.readFileSync(serverLog, 'utf8') : '');
 const submitted = [...text.matchAll(/frames submitted: (\d+)/g)].map((m) => Number(m[1])).pop() || 0;
 console.log(`runtime frames submitted (last milestone): ${submitted}`);
 if (!text.includes('session') || submitted < 10) fail('runtime did not see frames');

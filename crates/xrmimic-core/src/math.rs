@@ -3,6 +3,7 @@
 use std::ops::{Add, Mul, Neg, Sub};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Vec3 {
     pub x: f32,
     pub y: f32,
@@ -53,6 +54,7 @@ impl Neg for Vec3 {
 
 /// Unit quaternion (x, y, z, w).
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Quat {
     pub x: f32,
     pub y: f32,
@@ -113,6 +115,7 @@ impl Mul for Quat {
 
 /// Rigid transform: maps a point from the pose's local frame into its parent.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Pose {
     pub orientation: Quat,
     pub position: Vec3,
@@ -150,6 +153,7 @@ impl Pose {
 
 /// Field of view as OpenXR angles (radians; left and down are negative).
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Fov {
     pub left: f32,
     pub right: f32,

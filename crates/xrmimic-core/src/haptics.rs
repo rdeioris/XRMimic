@@ -14,6 +14,7 @@ pub const SHOWN_AT_LEAST_NS: i64 = 120_000_000;
 
 /// One XrHapticVibration.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Vibration {
     /// 0..1.
     pub amplitude: f32,
@@ -50,6 +51,7 @@ impl Vibration {
 
 /// One hand's haptics.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HapticState {
     /// The vibration playing and when it started (ns), until it ends or is stopped.
     pub playing: Option<(Vibration, i64)>,

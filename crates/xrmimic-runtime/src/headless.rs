@@ -13,7 +13,7 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn spawn(_gfx: &crate::gfx::SessionGfx, _sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> Window {
+    pub fn spawn(_luid: (u32, i32), _sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> Window {
         xlog!("headless headset (no display on this platform)");
         Window { shared }
     }

@@ -16,7 +16,10 @@ use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::core::PCWSTR;
+use windows::Win32::System::LibraryLoader::{
+    GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Input::XboxController::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -31,10 +34,10 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn spawn(gfx: &crate::gfx::SessionGfx, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> Window {
-        let luid = gfx.luid;
+    /// `luid`: the app's graphics adapter (low, high part): the window
+    /// opens the frames on the same one.
+    pub fn spawn(luid: (u32, i32), sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> Window {
         let s = shared.clone();
-        let luid = (luid.LowPart, luid.HighPart);
         let thread = std::thread::Builder::new()
             .name("xrmimic-window".into())
             .spawn(move || {
@@ -894,11 +897,27 @@ struct Opened {
     srgb_out: bool,
 }
 
+/// The window classes the window registers (the Input tab's pad among them).
+const CLASSES: [PCWSTR; 3] = [w!("xrmimic-headset"), w!("xrmimic-view"), w!("xrmimic-pad")];
+
 fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::core::Result<()> {
     unsafe {
         SHARED.with(|s| *s.borrow_mut() = Some(shared.clone()));
         let hidden = std::env::var_os("XRMIMIC_HIDDEN").is_some_and(|v| v != "0");
-        let hinst = GetModuleHandleW(None)?;
+        // The window classes belong to this DLL, not the app's EXE: an app
+        // that unloads and reloads the runtime (Unity, at each XR restart) may
+        // get it back at another address, and a class left registered under
+        // the EXE would still point at the old copy's window procedure.
+        let mut module = HMODULE::default();
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(wndproc as *const u16),
+            &mut module,
+        )?;
+        let hinst = module;
+        for name in CLASSES {
+            let _ = UnregisterClassW(name, Some(hinst.into()));
+        }
         let class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
@@ -1834,6 +1853,17 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
                     let _ = tx.send(image.clone());
                 }
             }
+            // Eye captures, from the frame as the window has it (an app's own
+            // process may answer first when the headset runs there).
+            if let (Some(o), true) = (&opened, latest_value > 0) {
+                let waiting = std::mem::take(&mut *shared.eye_requests.lock().unwrap());
+                if !waiting.is_empty() {
+                    let image = read_frame(&device, &context, &o.srvs[latest % o.srvs.len()]);
+                    for tx in waiting {
+                        let _ = tx.send(image.clone());
+                    }
+                }
+            }
 
             if let Some(path) = &snapshot {
                 // Shortly after the first frame arrives, once.
@@ -1877,7 +1907,9 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
         }
         end_drag();
         let _ = DestroyWindow(hwnd);
-        let _ = UnregisterClassW(w!("xrmimic-headset"), Some(hinst.into()));
+        for name in CLASSES {
+            let _ = UnregisterClassW(name, Some(hinst.into()));
+        }
         xlog!("window closed");
         Ok(())
     }
@@ -1887,6 +1919,48 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
 unsafe fn snapshot_window(hwnd: HWND, path: &std::path::Path) -> Result<(), String> {
     let i = window_image(hwnd)?;
     crate::log::write_bmp(path, i.width, i.height, &i.bgra).map_err(|e| e.to_string())
+}
+
+/// A frame texture the window has opened, read back (8-bit RGBA or BGRA).
+unsafe fn read_frame(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    srv: &ID3D11ShaderResourceView,
+) -> Result<crate::shared::Image, String> {
+    let res = srv.GetResource().map_err(|e| e.to_string())?;
+    let tex: ID3D11Texture2D = res.cast().map_err(|e| e.to_string())?;
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    tex.GetDesc(&mut desc);
+    let bgra = matches!(desc.Format, DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8A8_TYPELESS);
+    let rgba = matches!(desc.Format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB | DXGI_FORMAT_R8G8B8A8_TYPELESS);
+    if !bgra && !rgba {
+        return Err(format!("format {} not capturable", desc.Format.0));
+    }
+    let sdesc = D3D11_TEXTURE2D_DESC {
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+        ..desc
+    };
+    let mut staging = None;
+    device.CreateTexture2D(&sdesc, None, Some(&mut staging)).map_err(|e| e.to_string())?;
+    let staging = staging.ok_or("no staging texture")?;
+    context.CopyResource(&staging, &tex);
+    let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+    context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut m)).map_err(|e| e.to_string())?;
+    let (w, h) = (desc.Width as usize, desc.Height as usize);
+    let mut px = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let src = std::slice::from_raw_parts((m.pData as *const u8).add(y * m.RowPitch as usize), w * 4);
+        for x in 0..w {
+            let s = &src[x * 4..x * 4 + 4];
+            let (b, g, r) = if bgra { (s[0], s[1], s[2]) } else { (s[2], s[1], s[0]) };
+            px[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&[b, g, r, 255]);
+        }
+    }
+    context.Unmap(&staging, 0);
+    Ok(crate::shared::Image { width: w as u32, height: h as u32, bgra: px })
 }
 
 /// The window's client area (toolbar and eyes) as a picture, via PrintWindow.

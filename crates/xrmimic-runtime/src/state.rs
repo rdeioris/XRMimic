@@ -172,6 +172,7 @@ impl Runtime {
             return;
         }
         s.state = state;
+        s.headset.report_state(crate::control::state_name(state), s.running);
         let instance = s.instance;
         crate::xlog!("session {session} -> {state:?}");
         let time = crate::time::now_ns();
@@ -204,6 +205,7 @@ impl Runtime {
                 | Event::StageChanged { session: s, .. } => *s != session,
             });
         }
+        crate::control::unregister(session);
         self.spaces.retain(|_, s| s.session != session);
         self.swapchains.retain(|_, s| s.session != session);
         if let Some(mut s) = self.sessions.remove(&session) {

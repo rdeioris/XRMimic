@@ -22,8 +22,8 @@
 //! | `GET /v1/capture/eyes?format=png\|bmp` | the next frame's eyes side by side, as the app drew them |
 //! | `GET /v1/capture/window?format=png\|bmp` | the headset window (Windows) |
 
-use crate::headset::{self, HeadsetControl};
-use crate::state::{rt, Runtime, SessionData};
+use crate::headset::{self, FrameGate, HeadsetControl};
+use crate::state::rt;
 use crate::xlog;
 use openxr_sys as xr;
 use serde_json::{json, Value};
@@ -148,18 +148,99 @@ fn handle(request: &mut tiny_http::Request, token: Option<&str>) -> Reply {
     }
 }
 
+/// What the control API knows of a session, wherever its headset runs.
+pub struct SessionInfo {
+    pub handle: u64,
+    pub state: String,
+    pub running: bool,
+    /// Frames the app has ended, and those with a projection layer.
+    pub frame: u64,
+    pub shown: u64,
+    pub app: String,
+    pub profile: Option<String>,
+    /// The app's bindings in that profile: (binding path, action name).
+    pub bound: Vec<(String, String)>,
+}
+
+/// A session the control API can drive: one in this process, or one the
+/// server runs for an app elsewhere (crate::server).
+pub trait ControlledSession: Send + Sync {
+    /// None once the session is gone.
+    fn info(&self) -> Option<SessionInfo>;
+    fn control(&self) -> Option<Arc<dyn HeadsetControl>>;
+    fn gate(&self) -> Option<Arc<FrameGate>>;
+    /// (the frame-stepped clock is on, the frame period in ns).
+    fn clock(&self) -> (bool, i64);
+}
+
+static SESSIONS: std::sync::Mutex<Vec<(u64, Arc<dyn ControlledSession>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Make a session the control API's newest.
+pub fn register(key: u64, session: Arc<dyn ControlledSession>) {
+    let mut s = SESSIONS.lock().unwrap();
+    s.retain(|(k, _)| *k != key);
+    s.push((key, session));
+}
+
+pub fn unregister(key: u64) {
+    SESSIONS.lock().unwrap().retain(|(k, _)| *k != key);
+}
+
 /// The newest session.
-fn current(rt: &Runtime) -> Option<(u64, &SessionData)> {
-    rt.sessions.iter().max_by_key(|(h, _)| **h).map(|(h, s)| (*h, s))
+fn current() -> Option<Arc<dyn ControlledSession>> {
+    SESSIONS.lock().unwrap().last().map(|(_, s)| s.clone())
+}
+
+/// A session of this process's runtime (its OpenXR side and headset here).
+pub struct InProcessSession(pub u64);
+
+impl ControlledSession for InProcessSession {
+    fn info(&self) -> Option<SessionInfo> {
+        let rt = rt();
+        let s = rt.sessions.get(&self.0)?;
+        let app = rt.instances.get(&s.instance).map(|i| i.app_name.clone()).unwrap_or_default();
+        let bound = rt
+            .instances
+            .get(&s.instance)
+            .and_then(|i| i.suggested.get(&s.profile))
+            .map(|list| {
+                list.iter()
+                    .filter_map(|(action, path)| Some((rt.path_str(*path)?.to_string(), rt.actions.get(action)?.name.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(SessionInfo {
+            handle: self.0,
+            state: state_name(s.state).to_string(),
+            running: s.running,
+            frame: s.frames_ended,
+            shown: s.frames_shown,
+            app,
+            profile: rt.path_str(s.profile).map(str::to_string),
+            bound,
+        })
+    }
+
+    fn control(&self) -> Option<Arc<dyn HeadsetControl>> {
+        rt().sessions.get(&self.0).map(|s| s.headset.control())
+    }
+
+    fn gate(&self) -> Option<Arc<FrameGate>> {
+        rt().sessions.get(&self.0).map(|s| s.headset.frame_gate())
+    }
+
+    fn clock(&self) -> (bool, i64) {
+        rt().sessions.get(&self.0).map(|s| (s.headset.stepped(), s.headset.period_ns())).unwrap_or((false, 0))
+    }
+}
+
+fn current_control() -> Option<Arc<dyn HeadsetControl>> {
+    current()?.control()
 }
 
 fn with_headset(f: impl FnOnce(&dyn HeadsetControl) -> Result<Value, String>) -> Reply {
-    let control = {
-        let rt = rt();
-        match current(&rt) {
-            Some((_, s)) => s.headset.control(),
-            None => return error(409, "no session"),
-        }
+    let Some(control) = current_control() else {
+        return error(409, "no session");
     };
     match f(control.as_ref()) {
         Ok(v) => json_reply(200, v),
@@ -295,13 +376,9 @@ fn set_device(body: &Value) -> Reply {
 }
 
 fn clock(body: &Value) -> Reply {
-    let (gate, frame_before) = {
-        let rt = rt();
-        match current(&rt) {
-            Some((_, s)) => (s.headset.frame_gate(), s.frames_ended),
-            None => return error(409, "no session"),
-        }
-    };
+    let Some(session) = current() else { return error(409, "no session") };
+    let (Some(gate), Some(info)) = (session.gate(), session.info()) else { return error(409, "no session") };
+    let frame_before = info.frame;
     if let Some(p) = body["paused"].as_bool() {
         gate.set_paused(p);
     }
@@ -315,7 +392,7 @@ fn clock(body: &Value) -> Reply {
         let deadline = Instant::now() + Duration::from_secs(10);
         gate.wait_drained(Duration::from_secs(10));
         loop {
-            frame = current(&rt()).map(|(_, s)| s.frames_ended).unwrap_or(0);
+            frame = session.info().map(|i| i.frame).unwrap_or(0);
             if frame >= frame_before + step || Instant::now() > deadline {
                 break;
             }
@@ -326,7 +403,7 @@ fn clock(body: &Value) -> Reply {
     json_reply(200, json!({ "ok": true, "paused": paused, "allowed": allowed, "frame": frame }))
 }
 
-fn state_name(s: xr::SessionState) -> &'static str {
+pub fn state_name(s: xr::SessionState) -> &'static str {
     match s {
         xr::SessionState::IDLE => "IDLE",
         xr::SessionState::READY => "READY",
@@ -346,27 +423,13 @@ fn state() -> Value {
         "name": d.name, "preset": d.preset, "refresh_hz": d.default_refresh, "ipd": d.ipd,
         "eye_size": [d.eye_width, d.eye_height], "play_area": d.play_area, "controllers": d.controllers,
     });
-    let rt = rt();
-    let Some((h, s)) = current(&rt) else {
-        return json!({ "runtime": "XRMimic", "device": device, "session": null });
+    let none = json!({ "runtime": "XRMimic", "device": device, "session": null });
+    let Some(session) = current() else { return none };
+    let (Some(info), Some(control), Some(gate)) = (session.info(), session.control(), session.gate()) else {
+        return none;
     };
-    let app = rt.instances.get(&s.instance).map(|i| i.app_name.clone()).unwrap_or_default();
-    let profile = rt.path_str(s.profile).map(str::to_string);
-    let bound: Vec<Value> = rt
-        .instances
-        .get(&s.instance)
-        .and_then(|i| i.suggested.get(&s.profile))
-        .map(|list| {
-            list.iter()
-                .filter_map(|(action, path)| Some(json!([rt.path_str(*path)?, rt.actions.get(action)?.name])))
-                .collect()
-        })
-        .unwrap_or_default();
-    let control = s.headset.control();
-    let gate = s.headset.frame_gate();
-    let (stepped, period) = (s.headset.stepped(), s.headset.period_ns());
-    let (state, running, frame, shown) = (state_name(s.state), s.running, s.frames_ended, s.frames_shown);
-    drop(rt);
+    let (stepped, period) = session.clock();
+    let bound: Vec<Value> = info.bound.iter().map(|(p, a)| json!([p, a])).collect();
     let user = control.user();
     let held = control.held_inputs();
     let now = crate::time::now_ns();
@@ -403,8 +466,9 @@ fn state() -> Value {
         "runtime": "XRMimic",
         "device": device,
         "session": {
-            "handle": h, "state": state, "running": running, "frame": frame, "frames_shown": shown,
-            "app": app, "profile": profile, "bound": bound, "hands": control.hands(),
+            "handle": info.handle, "state": info.state, "running": info.running, "frame": info.frame,
+            "frames_shown": info.shown, "app": info.app, "profile": info.profile, "bound": bound,
+            "hands": control.hands(),
             "clock": { "stepped": stepped, "period_ns": period, "paused": paused, "allowed": allowed },
             "user": {
                 "head": pose_json(&user.head_pose()),
@@ -423,11 +487,11 @@ fn wait(query: &HashMap<String, String>) -> Reply {
     let timeout = Duration::from_millis(query.get("timeout_ms").and_then(|v| v.parse().ok()).unwrap_or(10_000));
     let deadline = Instant::now() + timeout;
     loop {
-        let (now_frame, now_state) = match current(&rt()) {
-            Some((_, s)) => (s.frames_ended, state_name(s.state)),
-            None => (0, "NONE"),
+        let (now_frame, now_state) = match current().and_then(|s| s.info()) {
+            Some(i) => (i.frame, i.state),
+            None => (0, "NONE".to_string()),
         };
-        let ok = frame.is_none_or(|f| now_frame >= f) && want_state.as_deref().is_none_or(|w| w == now_state);
+        let ok = frame.is_none_or(|f| now_frame >= f) && want_state.as_deref().is_none_or(|w| w == now_state.as_str());
         if ok {
             return json_reply(200, json!({ "ok": true, "frame": now_frame, "state": now_state }));
         }
@@ -444,13 +508,7 @@ fn capture(query: &HashMap<String, String>, window: bool) -> Reply {
     if format != "png" && format != "bmp" {
         return error(400, "format: png or bmp");
     }
-    let control = {
-        let rt = rt();
-        match current(&rt) {
-            Some((_, s)) => s.headset.control(),
-            None => return error(409, "no session"),
-        }
-    };
+    let Some(control) = current_control() else { return error(409, "no session") };
     let image = if window { control.capture_window(timeout) } else { control.capture_eyes(timeout) };
     let image = match image {
         Ok(i) => i,

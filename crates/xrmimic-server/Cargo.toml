@@ -1,0 +1,9 @@
+[package]
+name = "xrmimic-server"
+description = "The XRMimic headset in a process of its own, for apps started with XRMIMIC_SERVER=local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xrmimic-runtime = { path = "../xrmimic-runtime" }

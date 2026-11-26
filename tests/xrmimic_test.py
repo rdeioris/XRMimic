@@ -47,6 +47,10 @@ from ctypes import (POINTER, Structure, Union, byref, c_char, c_char_p, c_float,
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DLL = os.environ.get('XRMIMIC_TEST_DLL') or os.path.join(ROOT, 'target', 'release', 'xrmimic_runtime.dll')
+# XRMIMIC_PY_SERVER=1: each test's headset runs in xrmimic-server (started per
+# test with the same environment) instead of in the app's process.
+SERVER_MODE = os.environ.get('XRMIMIC_PY_SERVER', '') not in ('', '0')
+SERVER_EXE = os.path.join(os.path.dirname(DLL), 'xrmimic-server.exe')
 
 # ---------------------------------------------------------------- OpenXR constants
 
@@ -1794,8 +1798,20 @@ def child(test):
         with open(dev, 'w') as fh:
             fh.write(f'play_area_m={env["XRMIMIC_PY_PLAY_AREA"]}\n')
         env['XRMIMIC_DEVICE_FILE'] = dev
-    p = subprocess.run([sys.executable, os.path.abspath(__file__), '--scenario', scen], env=env, cwd=work,
-                       capture_output=True, text=True, timeout=180)
+    server = None
+    if SERVER_MODE:
+        env['XRMIMIC_SERVER'] = 'local'
+        env['XRMIMIC_SERVER_PIPE'] = f'xrmimic-py-{os.getpid()}-{test}'
+        server_env = dict(env, XRMIMIC_LOG=os.path.join(work, 'server.log'))
+        server = subprocess.Popen([SERVER_EXE], env=server_env, cwd=work,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), '--scenario', scen], env=env, cwd=work,
+                           capture_output=True, text=True, timeout=180)
+    finally:
+        if server is not None:
+            server.kill()
+            server.wait()
     line = next((l for l in reversed(p.stdout.splitlines()) if l.startswith('RESULT ')), None)
     if line is None:
         return {'checks': [], 'error': f'no result (exit {p.returncode})\n{p.stdout[-2000:]}\n{p.stderr[-2000:]}'}, work
@@ -1809,6 +1825,8 @@ class XRMimicTest(unittest.TestCase):
             raise unittest.SkipTest('XRMimic\'s D3D11 runtime: Windows only')
         if not os.path.exists(DLL):
             raise unittest.SkipTest(f'{DLL} not built (cargo build --release)')
+        if SERVER_MODE and not os.path.exists(SERVER_EXE):
+            raise unittest.SkipTest(f'{SERVER_EXE} not built (cargo build --release -p xrmimic-server)')
 
 
 def _make(test):

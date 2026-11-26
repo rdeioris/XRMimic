@@ -6,6 +6,7 @@ use xrmimic_core::math::Pose;
 
 /// How a layer's colours combine with what is under it.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Blend {
     /// No XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT: alpha ignored.
     Opaque,
@@ -17,6 +18,7 @@ pub enum Blend {
 
 /// The shape of a layer drawn over the projection layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub enum Shape {
     /// Width and height in metres.
@@ -37,6 +39,7 @@ pub enum Shape {
 /// is the distance (m) at depth `min`, `far` at `max` (near > far: reversed;
 /// either may be infinite).
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub struct DepthInfo {
     pub min: f32,
@@ -48,6 +51,7 @@ pub struct DepthInfo {
 /// Where a quad or cylinder layer sits (in STAGE space, resolved when it was
 /// submitted) and how it is drawn.
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[cfg_attr(not(windows), allow(dead_code))] // drawn by the Windows headset window only
 pub struct QuadMeta {
     pub pose: Pose,

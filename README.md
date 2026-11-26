@@ -440,10 +440,40 @@ control API's moves), so a run comes out the same every time and as fast as
 the app renders. With `POST /v1/clock {"paused": true}` frames wait until the
 test lets them through, one or many at a time.
 
-The server runs inside the app's process, so it is not available inside
-Chrome's sandbox (an AppContainer cannot listen on a port). The Python
-suite's `control`, `control_token` and `stepped_clock` tests use the
-API end to end.
+The API runs where the headset does: in the app's process, or in
+`xrmimic-server` (below). An app in Chrome's sandbox cannot listen on a port,
+so for Chrome use the server. The Python suite's `control`, `control_token`
+and `stepped_clock` tests use the API end to end.
+
+## The headset in its own process (xrmimic-server)
+
+By default the simulated headset (the user, the window and its tabs, the
+control API) lives inside the app's process. `xrmimic-server` runs it in a
+process of its own instead, and apps reach it over a named pipe:
+
+```powershell
+cargo build --release -p xrmimic-server
+$env:XRMIMIC_CONTROL = "127.0.0.1:8790"   # optional: the control API, now the server's
+target\release\xrmimic-server.exe          # keep it running
+
+# in the app's shell (Chrome: the shell that starts it)
+$env:XRMIMIC_SERVER = "local"
+```
+
+- The headset window stays up between app runs, and one server serves
+  several apps one after another. The Device tab, the keyboard and gamepad,
+  the control API and the frame-stepped clock work as they do in-process.
+- The app's runtime still makes its swapchains and copies each frame into
+  shared textures. The server takes those handles out of the app's process,
+  so frames are never copied twice.
+- The pipe admits Chrome's sandboxed XR process.
+- `XRMIMIC_SERVER_PIPE=<name>` picks another pipe (default `xrmimic`), so
+  several servers can run at once. Set the same name for the server and the
+  app.
+- With `XRMIMIC_SERVER` set and no server reachable, `xrCreateSession`
+  fails rather than quietly falling back to an in-process headset.
+- The app's `XRMIMIC_TEST_*` variables travel with the session to the
+  server's window.
 
 ## Tests
 
@@ -466,7 +496,8 @@ Input tab, hands, a device preset and a play-area change, and in the window's
 snapshots: projection, quad (both eyes, one eye), cylinder, equirect and cube
 layers, MSAA colour and depth, the Depth and Centre views, reprojection with
 and without depth, depth-tested layers, the boundary and the haptics bar.
-`-v -k <name>` runs one; `--scenario <name>` runs one scenario in this process
+`XRMIMIC_PY_SERVER=1` runs every test with its headset in an
+`xrmimic-server` started for that test. `-v -k <name>` runs one; `--scenario <name>` runs one scenario in this process
 and prints its checks; `XRMIMIC_TEST_DLL` points it at another build (a build
 with six features broken on purpose fails exactly the tests for them).
 
@@ -573,6 +604,9 @@ action refused), STAGE's bounds, and that a controller put down by itself
   `vk.rs`), and the simulated headset behind `headset.rs` (the simulated
   user's thread, the window and its tabs). The OpenXR side reaches the
   headset only through `headset.rs`.
+- `crates/xrmimic-server`: the headset in a process of its own. The pipe
+  and its messages are in `pipe.rs`, the app's side in `remote.rs`, and the
+  server's side in `server.rs`.
 - `crates/xrmimic-launch`: the out-of-sandbox helper.
 - `crates/xrmimic-minimal`: the smallest runtime that only advertises itself.
 

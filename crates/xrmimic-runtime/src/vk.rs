@@ -363,6 +363,11 @@ impl SessionGfx {
         })
     }
 
+    /// The app's graphics adapter: not known on Vulkan (there is no window to place).
+    pub fn adapter(&self) -> (u32, i32) {
+        (0, 0)
+    }
+
     pub fn create_swapchain(&self, session: u64, ci: &xr::SwapchainCreateInfo) -> Result<SwapchainData, xr::Result> {
         let format = vk::Format::from_raw(ci.format as i32);
         let depth = is_depth(format);

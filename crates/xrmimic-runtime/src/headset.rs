@@ -30,8 +30,13 @@ use xrmimic_core::math::Pose;
 use xrmimic_core::sim::{ControllerInput, SimState};
 use xrmimic_core::timing::FrameClock;
 
-/// The device the runtime pretends to be (the Device tab's settings).
+/// The device the runtime pretends to be (the Device tab's settings; the
+/// server's, when the headset runs in xrmimic-server).
 pub fn device() -> DeviceProfile {
+    #[cfg(windows)]
+    if let Some(d) = crate::remote::connection().and_then(|c| c.device()) {
+        return d;
+    }
     crate::devstore::current()
 }
 
@@ -83,6 +88,11 @@ pub trait Headset: Send {
     fn request_close(&self);
     /// What the control API may do with this headset (crate::control).
     fn control(&self) -> Arc<dyn HeadsetControl>;
+    /// The session's graphics copied a frame into the frame target (the
+    /// app's `frame`-th, `shown` of them with a projection layer).
+    fn frame_submitted(&self, _frame: u64, _shown: u64) {}
+    /// The session's state changed (for the control API).
+    fn report_state(&self, _state: &str, _running: bool) {}
     /// Stop the headset; returns the rest of the work (joining its threads)
     /// to do outside the runtime lock. Later calls return None.
     fn shutdown(&mut self) -> Option<Box<dyn FnOnce() + Send>>;
@@ -198,7 +208,8 @@ impl LocalHeadset {
     /// thread, the window on the graphics' adapter, and the frame clock at
     /// the device's refresh rate (XRMIMIC_REFRESH overrides it;
     /// XRMIMIC_CLOCK=step steps it per frame).
-    pub fn start(target: FrameTarget, gfx: &crate::gfx::SessionGfx, options: HeadsetOptions, now: i64) -> LocalHeadset {
+    /// `luid`: the graphics adapter the app renders on (low, high part).
+    pub fn start(target: FrameTarget, luid: (u32, i32), options: HeadsetOptions, now: i64) -> LocalHeadset {
         let shared = target;
         shared.hands.store(options.hands, Ordering::SeqCst);
         shared.depth_flip.store(options.depth_flip, Ordering::Relaxed);
@@ -213,7 +224,7 @@ impl LocalHeadset {
         let sim = Arc::new(Mutex::new(SimState::new(&device)));
         let driver = Arc::new(crate::simthread::Driver::new(&sim));
         let user_thread = crate::simthread::spawn(sim.clone(), shared.clone(), driver.clone());
-        let window = crate::ui::Window::spawn(gfx, sim.clone(), shared.clone());
+        let window = crate::ui::Window::spawn(luid, sim.clone(), shared.clone());
         let hz = std::env::var("XRMIMIC_REFRESH").ok().and_then(|s| s.parse().ok()).unwrap_or(device.default_refresh);
         let control = Arc::new(LocalControl { sim: sim.clone(), shared: shared.clone() });
         LocalHeadset {

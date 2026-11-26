@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/xrmimic-core", "crates/xrmimic-runtime", "crates/xrmimic-launch", "crates/xrmimic-minimal"]
+members = ["crates/xrmimic-core", "crates/xrmimic-runtime", "crates/xrmimic-launch", "crates/xrmimic-minimal", "crates/xrmimic-server"]
 
 [workspace.package]
 version = "0.1.0"

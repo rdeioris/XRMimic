@@ -1,7 +1,7 @@
 //! Instance, system, session, space, swapchain and frame entry points.
 
 use crate::gfx::{self, SessionGfx};
-use crate::headset::{self, Headset as _, HeadsetOptions, LocalHeadset};
+use crate::headset::{self, HeadsetOptions, LocalHeadset};
 use crate::state::*;
 use crate::{time, xlog};
 use openxr_sys as xr;
@@ -145,7 +145,14 @@ pub unsafe extern "system" fn create_instance(
     out: *mut xr::Instance,
 ) -> xr::Result {
     crate::traced!("xrCreateInstance", [info, out], || {
-        crate::control::start_once();
+        // The control API runs where the headset does (xrmimic-server's, with XRMIMIC_SERVER).
+        #[cfg(windows)]
+        let remote = crate::remote::wanted();
+        #[cfg(not(windows))]
+        let remote = false;
+        if !remote {
+            crate::control::start_once();
+        }
         let info = &*info;
         let app = read_str(&info.application_info.application_name);
         let engine = read_str(&info.application_info.engine_name);
@@ -511,7 +518,31 @@ pub unsafe extern "system" fn create_session(
             depth_flip_auto: auto,
         };
         let now = time::now_ns();
-        let headset = LocalHeadset::start(target, &gfx, options, now);
+        // The headset: in this process, or in xrmimic-server (XRMIMIC_SERVER).
+        #[cfg(windows)]
+        let remote = crate::remote::connection();
+        // Asked for the server but cannot reach it: fail rather than quietly
+        // run the headset here.
+        #[cfg(windows)]
+        if remote.is_none() && crate::remote::wanted() {
+            return xr::Result::ERROR_RUNTIME_FAILURE;
+        }
+        #[cfg(not(windows))]
+        let remote: Option<()> = None;
+        let in_process = remote.is_none();
+        let headset: Box<dyn headset::Headset> = match remote {
+            #[cfg(windows)]
+            Some(conn) => match crate::remote::RemoteHeadset::start(conn, target, gfx.adapter(), options) {
+                Ok(h) => Box::new(h),
+                Err(e) => {
+                    xlog!("xrmimic-server refused the session: {e}");
+                    return xr::Result::ERROR_RUNTIME_FAILURE;
+                }
+            },
+            #[cfg(not(windows))]
+            Some(()) => unreachable!(),
+            None => Box::new(LocalHeadset::start(target, gfx.adapter(), options, now)),
+        };
         let hz = 1e9 / headset.period_ns() as f64;
         let h = rt.new_handle();
         rt.sessions.insert(
@@ -522,7 +553,7 @@ pub unsafe extern "system" fn create_session(
                 running: false,
                 exit_requested: false,
                 gfx,
-                headset: Box::new(headset),
+                headset,
                 last_wake: now,
                 frame_begun: false,
                 frames_waited: 0,
@@ -540,6 +571,9 @@ pub unsafe extern "system" fn create_session(
                 stage_bounds: headset::device().play_area,
             },
         );
+        if in_process {
+            crate::control::register(h, std::sync::Arc::new(crate::control::InProcessSession(h)));
+        }
         xlog!("session {h} created ({hz:.0} Hz)");
         rt.set_state(h, xr::SessionState::IDLE);
         rt.set_state(h, xr::SessionState::READY);
@@ -1300,6 +1334,7 @@ pub unsafe extern "system" fn end_frame(session: xr::Session, info: *const xr::F
             }
         }
         s.gfx.submit(&eyes, &views, &quads, &depths, s.frames_shown);
+        s.headset.frame_submitted(n, s.frames_shown);
         // Tests only: behave as if the user closed the headset window after N frames.
         if std::env::var("XRMIMIC_TEST_CLOSE_AFTER").ok().and_then(|v| v.parse::<u64>().ok()) == Some(n) {
             s.headset.request_close();

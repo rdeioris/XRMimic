@@ -19,6 +19,15 @@ mod shared;
 mod simthread;
 mod state;
 
+// The headset in xrmimic-server instead of the app (Windows): the pipe and
+// its messages, the app's side, the server's side.
+#[cfg(windows)]
+mod pipe;
+#[cfg(windows)]
+mod remote;
+#[cfg(windows)]
+pub mod server;
+
 // The graphics backend: session binding, swapchain images, frame copies.
 #[cfg(windows)]
 mod d3d;

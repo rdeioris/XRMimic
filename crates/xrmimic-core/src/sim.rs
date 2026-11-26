@@ -10,6 +10,7 @@ pub const RIGHT: usize = 1;
 
 /// One controller's input values (Touch layout).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ControllerInput {
     pub thumbstick: [f32; 2],
     pub trigger: f32,
@@ -109,6 +110,7 @@ pub struct InputFrame {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SimState {
     pub head_position: Vec3,
     pub yaw: f32,

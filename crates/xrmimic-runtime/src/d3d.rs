@@ -108,7 +108,7 @@ pub fn eye_source(sc: &SwapchainData, idx: u32, sub: &xr::SwapchainSubImage) -> 
 }
 
 /// What the runtime and the window thread exchange about frames.
-#[derive(Default)]
+#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Slot {
     /// NT handles of the ring of shared side-by-side textures and of the fence
     /// signalled after each copy (all owned by the runtime).
@@ -134,7 +134,7 @@ pub struct Slot {
 /// One eye's depth buffer as the window sees it: a ring of shared textures
 /// (typeless copies of the app's whole depth image), the format to read them
 /// with, the eye's rectangle in them (x, y, w, h) and how to read the values.
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DepthSlot {
     pub eye: usize,
     pub handles: Vec<usize>,
@@ -168,7 +168,7 @@ fn depth_drawn(format: DXGI_FORMAT, sample_count: u32, flipped: bool) -> bool {
 
 /// One quad layer as the window sees it: its own ring of shared textures
 /// (same ring index and fence as the eyes) and where to draw it.
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct QuadSlot {
     pub handles: Vec<usize>,
     pub generation: u64,
@@ -814,6 +814,11 @@ impl SessionGfx {
             }
         }
         Some(())
+    }
+
+    /// The app's graphics adapter (LUID low, high part).
+    pub fn adapter(&self) -> (u32, i32) {
+        (self.luid.LowPart, self.luid.HighPart)
     }
 
     /// The app's depth images are upside down relative to its colour: they
