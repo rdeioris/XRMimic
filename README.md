@@ -366,7 +366,12 @@ values through linear views. `node tools/smoke/smoke.mjs --webgpu` checks the
 WebGPU path (red | green eyes, through `XRGPUBinding`).
 
 The runtime logs every entry point it is given and the first calls of each to
-`XRMIMIC_LOG` (the launcher prints where).
+`XRMIMIC_LOG` (the launcher prints where). Each run starts the log afresh and
+keeps the one before as `xrmimic.log.prev`; processes of one app that are
+running together (and a sandboxed process, which cannot tell) share the file.
+Layers left out because their values describe nothing to draw (a cylinder
+with no radius, an equirect whose upper angle is not above its lower one) are
+logged as "layer not drawn" with the values.
 
 ## Linux
 

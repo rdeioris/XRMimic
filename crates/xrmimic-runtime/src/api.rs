@@ -1037,6 +1037,16 @@ pub unsafe extern "system" fn begin_frame(session: xr::Session, _info: *const xr
     })
 }
 
+/// Logs a layer xrEndFrame leaves out because its values describe nothing to
+/// draw: the first few times, then every 1000th.
+fn layer_dropped(kind: &str, why: &str) {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 8 || n % 1000 == 0 {
+        crate::xlog!("{kind} layer not drawn (#{n}): {why}");
+    }
+}
+
 pub unsafe extern "system" fn end_frame(session: xr::Session, info: *const xr::FrameEndInfo) -> xr::Result {
     crate::traced!("xrEndFrame", [session, info], || {
         let mut rt = rt();
@@ -1080,6 +1090,15 @@ pub unsafe extern "system" fn end_frame(session: xr::Session, info: *const xr::F
                 xr::StructureType::COMPOSITION_LAYER_CYLINDER_KHR => {
                     let c = &*(l as *const xr::CompositionLayerCylinderKHR);
                     let ok = c.radius.is_finite() && c.radius > 0.0 && c.central_angle > 0.0 && c.aspect_ratio > 0.0;
+                    if !ok {
+                        layer_dropped(
+                            "cylinder",
+                            &format!(
+                                "radius {}, central angle {}, aspect ratio {} (all must be > 0)",
+                                c.radius, c.central_angle, c.aspect_ratio
+                            ),
+                        );
+                    }
                     ok.then(|| {
                         (
                             c.layer_flags,
@@ -1101,6 +1120,15 @@ pub unsafe extern "system" fn end_frame(session: xr::Session, info: *const xr::F
                     let upper = e.upper_vertical_angle.clamp(-FRAC_PI_2, FRAC_PI_2);
                     let lower = e.lower_vertical_angle.clamp(-FRAC_PI_2, FRAC_PI_2);
                     let ok = !e.radius.is_nan() && e.radius >= 0.0 && e.central_horizontal_angle > 0.0 && upper > lower;
+                    if !ok {
+                        layer_dropped(
+                            "equirect2",
+                            &format!(
+                                "radius {}, central horizontal angle {}, upper vertical angle {}, lower vertical angle {}                                  (radius >= 0, horizontal angle > 0 and upper > lower needed)",
+                                e.radius, e.central_horizontal_angle, e.upper_vertical_angle, e.lower_vertical_angle
+                            ),
+                        );
+                    }
                     // 0 or +inf: a sphere at infinity, drawn far away and
                     // centred on the eye so it shows no parallax.
                     let infinite = e.radius == 0.0 || e.radius.is_infinite();

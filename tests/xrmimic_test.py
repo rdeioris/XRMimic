@@ -1192,7 +1192,8 @@ def s_stage_change():
 @scenario
 def s_layers():
     """Projection, quads (both eyes, left only), cylinder and equirect in the window;
-    the frame capture holds the projection layer alone."""
+    the frame capture holds the projection layer alone. An equirect with an empty
+    band (upper angle below lower) is left out and said so in the log."""
     c = Checks()
     samples = 4 if os.environ.get('XRMIMIC_PY_MSAA') else 1
     app = App()
@@ -1216,7 +1217,11 @@ def s_layers():
                                       aspectRatio=cyl['aspectRatio'])
         el = CompositionLayerEquirect2(space=app.local.value, eyeVisibility=EYES_BOTH, subImage=yellow.sub(), pose=pose(),
                                        radius=0.0, **eq)
-        return [app.projection(eyes, views), el, cl, quad(app, blue, quad_a, 0.6), quad(app, white, quad_b, 0.3, EYES_LEFT)]
+        empty = CompositionLayerEquirect2(space=app.local.value, eyeVisibility=EYES_BOTH, subImage=yellow.sub(), pose=pose(),
+                                          radius=0.0, centralHorizontalAngle=0.8, upperVerticalAngle=-0.2,
+                                          lowerVerticalAngle=0.2)
+        return [app.projection(eyes, views), el, empty, cl, quad(app, blue, quad_a, 0.6),
+                quad(app, white, quad_b, 0.3, EYES_LEFT)]
     app.run(render, snapshot=snapshot_path())
     views = app.last_views
     app.stop()
@@ -1230,6 +1235,10 @@ def s_layers():
         c.colour(f'{name} eye: equirect band at infinity', win.px(*win.eye_dir(e, views[e], (0, math.sin(el), -math.cos(el)))), rgb(YELLOW))
     c.colour('left eye: left-eye-only quad', win.px(*win.eye_point(0, views[0], (0.7, 0, -2))), rgb(WHITE))
     c.colour('right eye: no left-eye-only quad', win.px(*win.eye_point(1, views[1], (0.7, 0, -2))), rgb(GREEN))
+    with open(os.environ['XRMIMIC_LOG'], encoding='utf-8', errors='replace') as fh:
+        said = [l for l in fh if 'equirect2 layer not drawn' in l]
+    c.ok('log: empty equirect band reported', bool(said) and 'upper vertical angle -0.2' in said[0],
+         said[0].strip() if said else 'no line', 'equirect2 layer not drawn ... upper vertical angle -0.2')
     cap = os.environ['XRMIMIC_CAPTURE']
     cw, ch, cpx = read_bmp(cap)
     c.colour('capture: left eye', cpx(cw // 4, ch // 2), rgb(RED))
