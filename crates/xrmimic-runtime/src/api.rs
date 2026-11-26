@@ -873,10 +873,11 @@ pub unsafe extern "system" fn enumerate_swapchain_formats(
     out: *mut i64,
 ) -> xr::Result {
     crate::traced!("xrEnumerateSwapchainFormats", [session, capacity, count, out], || {
-        if !rt().sessions.contains_key(&session.into_raw()) {
-            return xr::Result::ERROR_HANDLE_INVALID;
-        }
-        fill(capacity, count, out, &gfx::swapchain_formats())
+        let formats = match rt().sessions.get(&session.into_raw()) {
+            Some(s) => s.gfx.swapchain_formats(),
+            None => return xr::Result::ERROR_HANDLE_INVALID,
+        };
+        fill(capacity, count, out, &formats)
     })
 }
 

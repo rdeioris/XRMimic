@@ -33,8 +33,11 @@ pub mod server;
 mod d3d;
 #[cfg(windows)]
 use d3d as gfx;
-#[cfg(target_os = "linux")]
+// Vulkan: the whole backend on Linux; on Windows the app's side of it, its
+// frames taken on to the D3D11 window by vkd3d.
 mod vk;
+#[cfg(windows)]
+mod vkd3d;
 #[cfg(target_os = "linux")]
 use vk as gfx;
 

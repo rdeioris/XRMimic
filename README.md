@@ -1,7 +1,8 @@
 # XRMimic
 
 An OpenXR runtime for Windows that simulates a headset in a desktop window, so
-WebXR pages in desktop Chrome (`immersive-vr`) can be tested without hardware.
+WebXR pages in desktop Chrome (`immersive-vr`) and native OpenXR apps (D3D11 or
+Vulkan) can be tested without hardware.
 It pretends to be a Quest 2: 1832×1920 per eye, its field of view, a 63 mm IPD,
 90 Hz and two Touch controllers.
 
@@ -478,6 +479,33 @@ $env:XRMIMIC_SERVER = "local"
 - The app's `XRMIMIC_TEST_*` variables travel with the session to the
   server's window.
 
+## Vulkan apps on Windows
+
+Besides `XR_KHR_D3D11_enable`, the Windows runtime offers
+`XR_KHR_vulkan_enable2`, so Vulkan-only engines such as Godot 4 and LÖVR can
+run against it.
+
+- The app's Vulkan instance and device are created through
+  `xrCreateVulkanInstanceKHR` and `xrCreateVulkanDeviceKHR`. The physical
+  device is the GPU that D3D11 apps are told to use. XRMimic adds
+  `VK_KHR_external_memory_win32`, `VK_KHR_external_semaphore_win32` and
+  timeline semaphores to the device. Apps that create their device themselves
+  (`XR_KHR_vulkan_enable` v1) are not supported.
+- The app renders into ordinary Vulkan swapchain images. At `xrEndFrame`,
+  XRMimic copies the layers it uses (eyes, quads, depth) into D3D11 textures
+  imported into the app's device. The copies run on the app's queue: MSAA
+  colour is resolved, and depth goes through a buffer into a float texture.
+  A shared fence tells the D3D11 side when they are done. From there a frame
+  goes the way a D3D11 app's does, so the window, its views and
+  `xrmimic-server` all work.
+- Formats: `B8G8R8A8` and `R8G8B8A8` (UNORM and sRGB), `R16G16B16A16_SFLOAT`,
+  and for depth `D32_SFLOAT`, `D16_UNORM` and `D32_SFLOAT_S8_UINT`.
+  `D24_UNORM_S8_UINT` and MSAA depth swapchains are not offered yet.
+- `cargo run --release -p xrmimic-runtime --example vk_client` is a small
+  Vulkan client. With `XRMIMIC_TEST_SNAPSHOT=<out.bmp>` it checks the window's
+  picture: `-- msaa`, `-- depth` and `-- depth16` cover MSAA eyes and the
+  Depth view.
+
 ## Tests
 
 ```powershell
@@ -573,7 +601,7 @@ action refused), STAGE's bounds, and that a controller put down by itself
 
 ## Limits
 
-- Windows (D3D11, headset window) and Linux (Vulkan, headless only).
+- Windows (D3D11 and Vulkan apps, headset window) and Linux (Vulkan, headless only).
 - The headset runs at 90 Hz (`XRMIMIC_REFRESH=72` for 72) independently of the
   desktop monitor; the window shows the newest frame at the monitor's rate.
 - Layers drawn in the headset window: one projection layer and up to eight
@@ -604,7 +632,8 @@ action refused), STAGE's bounds, and that a controller put down by itself
   simulated user and binding paths.
 - `crates/xrmimic-runtime`: the runtime DLL: the OpenXR entry points
   (`api.rs`, `input.rs`, `handtrack.rs`), the graphics backends (`d3d.rs`,
-  `vk.rs`), and the simulated headset behind `headset.rs` (the simulated
+  `vk.rs`, and `vkd3d.rs`, which takes a Vulkan app's frames on to D3D11 on
+  Windows), and the simulated headset behind `headset.rs` (the simulated
   user's thread, the window and its tabs). The OpenXR side reaches the
   headset only through `headset.rs`.
 - `crates/xrmimic-server`: the headset in a process of its own. The pipe

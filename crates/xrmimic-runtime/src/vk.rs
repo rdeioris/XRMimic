@@ -1,6 +1,9 @@
-//! Vulkan side (Linux): XR_KHR_vulkan_enable2. The runtime creates the app's
-//! VkInstance and VkDevice, hands out swapchain images made on that device,
-//! and can read a submitted frame back for tests (`XRMIMIC_CAPTURE`).
+//! Vulkan side: XR_KHR_vulkan_enable2. The runtime creates the app's
+//! VkInstance and VkDevice and hands out swapchain images made on that
+//! device. On Linux this is the whole backend (it can read a submitted frame
+//! back for tests, `XRMIMIC_CAPTURE`); on Windows crate::vkd3d takes the
+//! frames on to the D3D11 window.
+#![cfg_attr(windows, allow(dead_code))]
 
 use crate::shared::Shared;
 use crate::xlog;
@@ -10,19 +13,35 @@ use openxr_sys as xr;
 use std::ffi::{c_void, CStr};
 use std::sync::{Arc, Mutex};
 
-/// The extensions this backend adds.
+/// The extensions this backend adds (Linux; on Windows d3d.rs lists them).
 pub const EXTENSIONS: &[(&str, u32)] = &[("XR_KHR_vulkan_enable2", 2), ("XR_KHR_convert_timespec_time", 1)];
 
 /// Formats offered to apps, preferred first (Chrome takes the first of
 /// BGRA sRGB, BGRA, RGBA sRGB, RGBA that it finds).
-const COLOR_FORMATS: [vk::Format; 4] = [
+#[cfg(not(windows))]
+const COLOR_FORMATS: &[vk::Format] = &[
     vk::Format::B8G8R8A8_SRGB,
     vk::Format::B8G8R8A8_UNORM,
     vk::Format::R8G8B8A8_SRGB,
     vk::Format::R8G8B8A8_UNORM,
 ];
-const DEPTH_FORMATS: [vk::Format; 3] =
-    [vk::Format::D24_UNORM_S8_UINT, vk::Format::D32_SFLOAT, vk::Format::D16_UNORM];
+#[cfg(not(windows))]
+const DEPTH_FORMATS: &[vk::Format] = &[vk::Format::D24_UNORM_S8_UINT, vk::Format::D32_SFLOAT, vk::Format::D16_UNORM];
+// Windows: the formats crate::vkd3d has proxies for.
+#[cfg(windows)]
+const COLOR_FORMATS: &[vk::Format] = &[
+    vk::Format::B8G8R8A8_SRGB,
+    vk::Format::B8G8R8A8_UNORM,
+    vk::Format::R8G8B8A8_SRGB,
+    vk::Format::R8G8B8A8_UNORM,
+    vk::Format::R16G16B16A16_SFLOAT,
+];
+#[cfg(windows)]
+const DEPTH_FORMATS: &[vk::Format] = &[vk::Format::D32_SFLOAT, vk::Format::D16_UNORM, vk::Format::D32_SFLOAT_S8_UINT];
+
+fn has_stencil(f: vk::Format) -> bool {
+    matches!(f, vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT)
+}
 
 pub fn swapchain_formats() -> Vec<i64> {
     COLOR_FORMATS.iter().chain(DEPTH_FORMATS.iter()).map(|f| f.as_raw() as i64).collect()
@@ -33,6 +52,7 @@ fn is_depth(f: vk::Format) -> bool {
 }
 
 /// What the runtime and the headless headset thread exchange.
+#[cfg(not(windows))]
 #[derive(Default)]
 pub struct Slot {
     pub frames: u64,
@@ -68,7 +88,9 @@ pub fn lookup(name: &str) -> Option<xr::pfn::VoidFunction> {
             "xrCreateVulkanInstanceKHR" => t(create_instance as xr::pfn::CreateVulkanInstanceKHR),
             "xrGetVulkanGraphicsDevice2KHR" => t(graphics_device as xr::pfn::GetVulkanGraphicsDevice2KHR),
             "xrCreateVulkanDeviceKHR" => t(create_device as xr::pfn::CreateVulkanDeviceKHR),
+            #[cfg(unix)]
             "xrConvertTimespecTimeToTimeKHR" => t(timespec_to_time as xr::pfn::ConvertTimespecTimeToTimeKHR),
+            #[cfg(unix)]
             "xrConvertTimeToTimespecTimeKHR" => t(time_to_timespec as xr::pfn::ConvertTimeToTimespecTimeKHR),
             _ => return None,
         })
@@ -76,6 +98,7 @@ pub fn lookup(name: &str) -> Option<xr::pfn::VoidFunction> {
 }
 
 // XR_KHR_convert_timespec_time: XrTime is CLOCK_MONOTONIC in nanoseconds.
+#[cfg(unix)]
 unsafe extern "system" fn timespec_to_time(
     _instance: xr::Instance,
     ts: *const libc::timespec,
@@ -88,6 +111,7 @@ unsafe extern "system" fn timespec_to_time(
     })
 }
 
+#[cfg(unix)]
 unsafe extern "system" fn time_to_timespec(
     _instance: xr::Instance,
     t: xr::Time,
@@ -170,6 +194,27 @@ unsafe fn pick_physical_device(inst: &ash::Instance) -> Option<vk::PhysicalDevic
         vk::PhysicalDeviceType::CPU => 4,
         _ => 3,
     };
+    // Windows: the adapter D3D11 apps are told to use, so the window and the
+    // app share a GPU.
+    #[cfg(windows)]
+    if want.is_none() {
+        if let Some(luid) = crate::d3d::default_adapter_luid() {
+            for &d in &devices {
+                let mut id = vk::PhysicalDeviceIDProperties::default();
+                let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+                inst.get_physical_device_properties2(d, &mut p2);
+                let l = id.device_luid;
+                if id.device_luid_valid != 0
+                    && u32::from_le_bytes(l[0..4].try_into().unwrap()) == luid.LowPart
+                    && i32::from_le_bytes(l[4..8].try_into().unwrap()) == luid.HighPart
+                {
+                    let p = inst.get_physical_device_properties(d);
+                    xlog!("Vulkan device for the app: {} (the D3D11 adapter)", CStr::from_ptr(p.device_name.as_ptr()).to_string_lossy());
+                    return Some(d);
+                }
+            }
+        }
+    }
     let mut best: Option<(i32, vk::PhysicalDevice, String)> = None;
     for d in devices {
         let p = inst.get_physical_device_properties(d);
@@ -235,6 +280,11 @@ unsafe extern "system" fn create_device(
         let exts: Vec<String> = (0..ci.enabled_extension_count as usize)
             .map(|i| CStr::from_ptr(*ci.pp_enabled_extension_names.add(i)).to_string_lossy().into_owned())
             .collect();
+        // Windows: what sharing frames with the D3D11 window takes.
+        #[cfg(windows)]
+        let mut own = windows_device_needs(ci, &exts);
+        #[cfg(windows)]
+        let ci = &own.info();
         let mut dev = vk::Device::null();
         let r = create(
             vk::PhysicalDevice::from_raw(info.vulkan_physical_device as u64),
@@ -249,10 +299,75 @@ unsafe extern "system" fn create_device(
     })
 }
 
+/// The app's device extensions plus the ones the D3D11 window needs, and
+/// timeline semaphores turned on (in the app's own feature struct if it
+/// chains one, else in one of ours put first).
+#[cfg(windows)]
+struct DeviceNeeds {
+    base: vk::DeviceCreateInfo<'static>,
+    names: Vec<std::ffi::CString>,
+    ptrs: Vec<*const std::ffi::c_char>,
+    timeline: Box<vk::PhysicalDeviceTimelineSemaphoreFeatures<'static>>,
+    prepend: bool,
+}
+
+#[cfg(windows)]
+impl DeviceNeeds {
+    fn info(&mut self) -> vk::DeviceCreateInfo<'static> {
+        self.ptrs = self.names.iter().map(|n| n.as_ptr()).collect();
+        let mut ci = self.base;
+        ci.enabled_extension_count = self.ptrs.len() as u32;
+        ci.pp_enabled_extension_names = self.ptrs.as_ptr();
+        if self.prepend {
+            self.timeline.p_next = self.base.p_next as *mut c_void;
+            ci.p_next = &*self.timeline as *const _ as *const c_void;
+        }
+        ci
+    }
+}
+
+#[cfg(windows)]
+unsafe fn windows_device_needs(ci: &vk::DeviceCreateInfo, exts: &[String]) -> DeviceNeeds {
+    let mut names: Vec<std::ffi::CString> = exts.iter().map(|e| std::ffi::CString::new(e.as_str()).unwrap()).collect();
+    for want in ["VK_KHR_external_memory_win32", "VK_KHR_external_semaphore_win32", "VK_KHR_timeline_semaphore"] {
+        if !exts.iter().any(|e| e == want) {
+            names.push(std::ffi::CString::new(want).unwrap());
+        }
+    }
+    // Timeline semaphores: set in the app's own struct where there is one.
+    let mut prepend = true;
+    let mut p = ci.p_next as *mut vk::BaseOutStructure;
+    while !p.is_null() {
+        match (*p).s_type {
+            vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES => {
+                (*(p as *mut vk::PhysicalDeviceVulkan12Features)).timeline_semaphore = vk::TRUE;
+                prepend = false;
+            }
+            vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES => {
+                (*(p as *mut vk::PhysicalDeviceTimelineSemaphoreFeatures)).timeline_semaphore = vk::TRUE;
+                prepend = false;
+            }
+            _ => {}
+        }
+        p = (*p).p_next;
+    }
+    DeviceNeeds {
+        base: std::mem::transmute::<vk::DeviceCreateInfo<'_>, vk::DeviceCreateInfo<'static>>(*ci),
+        names,
+        ptrs: Vec::new(),
+        timeline: Box::new(vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true)),
+        prepend,
+    }
+}
+
 pub struct SessionGfx {
-    device: ash::Device,
-    queue: vk::Queue,
-    pool: vk::CommandPool,
+    pub(crate) device: ash::Device,
+    pub(crate) queue: vk::Queue,
+    pub(crate) pool: vk::CommandPool,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) instance: ash::Instance,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) physical: vk::PhysicalDevice,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     mem_props: vk::PhysicalDeviceMemoryProperties,
@@ -368,7 +483,8 @@ impl SessionGfx {
             (std::path::PathBuf::from(p), frame)
         });
         xlog!("session on queue family {} index {}", b.queue_family_index, b.queue_index);
-        Ok(SessionGfx { device, queue, pool, cmd, fence, mem_props, shared, capture })
+        let physical = vk::PhysicalDevice::from_raw(b.physical_device as u64);
+        Ok(SessionGfx { device, queue, pool, instance: inst, physical, cmd, fence, mem_props, shared, capture })
     }
 
     /// Record commands with `f` and run them on the app's queue, waiting for
@@ -388,7 +504,11 @@ impl SessionGfx {
         d.reset_fences(&[self.fence])
     }
 
-    fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags) -> Option<u32> {
+    pub fn swapchain_formats(&self) -> Vec<i64> {
+        swapchain_formats()
+    }
+
+    pub(crate) fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags) -> Option<u32> {
         (0..self.mem_props.memory_type_count).find(|&i| {
             bits & (1 << i) != 0 && self.mem_props.memory_types[i as usize].property_flags.contains(want)
         })
@@ -477,7 +597,7 @@ impl SessionGfx {
             // Swapchain images are handed to the app in the attachment layout.
             let (aspect, layout) = if depth {
                 let mut a = vk::ImageAspectFlags::DEPTH;
-                if format == vk::Format::D24_UNORM_S8_UINT {
+                if has_stencil(format) {
                     a |= vk::ImageAspectFlags::STENCIL;
                 }
                 (a, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
@@ -547,6 +667,7 @@ impl SessionGfx {
 
     /// A frame was submitted. Without a display there is nothing to show; the
     /// frame is only counted, and read back once when a test asks for it.
+    #[cfg(not(windows))]
     pub fn submit(
         &mut self,
         eyes: &[EyeSource],

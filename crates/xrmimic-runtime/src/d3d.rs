@@ -17,6 +17,8 @@ pub const EXTENSIONS: &[(&str, u32)] = &[
     // AppContainer. xrmimic does: it needs no IPC, only its own folder's files.
     ("XR_EXT_win32_appcontainer_compatible", 1),
     ("XR_KHR_D3D11_enable", 9),
+    // Vulkan apps: their frames reach the window through crate::vkd3d.
+    ("XR_KHR_vulkan_enable2", 2),
     ("XR_KHR_win32_convert_performance_counter_time", 1),
 ];
 
@@ -34,7 +36,7 @@ pub fn lookup(name: &str) -> Option<xr::pfn::VoidFunction> {
             "xrConvertTimeToWin32PerformanceCounterKHR" => {
                 t(time_to_qpc as xr::pfn::ConvertTimeToWin32PerformanceCounterKHR)
             }
-            _ => return None,
+            _ => return crate::vk::lookup(name),
         })
     }
 }
@@ -85,6 +87,9 @@ pub fn swapchain_formats() -> Vec<i64> {
 }
 
 pub unsafe fn write_images(sc: &SwapchainData, out: *mut xr::SwapchainImageBaseHeader) -> xr::Result {
+    if let Some(v) = &sc.vk {
+        return crate::vkd3d::write_images(v, out);
+    }
     let out = out as *mut xr::SwapchainImageD3D11KHR;
     for (i, img) in sc.images.iter().enumerate() {
         let o = &mut *out.add(i);
@@ -104,6 +109,7 @@ pub fn eye_source(sc: &SwapchainData, idx: u32, sub: &xr::SwapchainSubImage) -> 
         rect: sub.image_rect,
         format: sc.format,
         sample_count: sc.sample_count,
+        vk: sc.vk.as_ref().map(|v| crate::vkd3d::copy_for(v, idx, sub.image_array_index)),
     }
 }
 
@@ -287,6 +293,8 @@ pub struct SessionGfx {
     /// cannot be read by a shader), and the pass that takes sample 0 of it.
     msaa_depth: Vec<Option<ID3D11Texture2D>>,
     depth_resolver: Option<DepthResolver>,
+    /// A Vulkan app's session (this device is then the runtime's own).
+    pub vk: Option<Box<crate::vkd3d::Bridge>>,
 }
 
 // The app's device is free-threaded; its immediate context is only used from
@@ -308,6 +316,8 @@ pub struct SwapchainData {
     pub next_index: u32,
     pub acquired: std::collections::VecDeque<u32>,
     pub last_released: Option<u32>,
+    /// A Vulkan app's swapchain: its images (`images` are their proxies).
+    pub vk: Option<crate::vkd3d::Images>,
 }
 
 unsafe impl Send for SwapchainData {}
@@ -321,6 +331,8 @@ pub struct EyeSource {
     pub rect: xr::Rect2Di,
     pub format: DXGI_FORMAT,
     pub sample_count: u32,
+    /// A Vulkan app's image: copied into `texture` (its proxy) first.
+    pub vk: Option<crate::vkd3d::VkCopy>,
 }
 
 /// Reads sample 0 of an MSAA depth image into an R32_FLOAT texture, on the
@@ -405,6 +417,9 @@ impl DepthResolver {
 impl SessionGfx {
     /// The session's graphics binding from xrCreateSession's `next` chain.
     pub unsafe fn from_session_create(next: *const std::ffi::c_void, shared: Arc<Shared>) -> Result<SessionGfx, xr::Result> {
+        if !crate::api::find_in_chain(next, xr::StructureType::GRAPHICS_BINDING_VULKAN_KHR).is_null() {
+            return crate::vkd3d::session(next, shared);
+        }
         let b = crate::api::find_in_chain(next, xr::StructureType::GRAPHICS_BINDING_D3D11_KHR);
         if b.is_null() {
             xlog!("xrCreateSession: no D3D11 graphics binding");
@@ -438,10 +453,23 @@ impl SessionGfx {
             resolves: Vec::new(),
             msaa_depth: Vec::new(),
             depth_resolver: None,
+            vk: None,
+        }
+    }
+
+    /// The formats this session's swapchains may have (DXGI, or Vulkan).
+    pub fn swapchain_formats(&self) -> Vec<i64> {
+        if self.vk.is_some() {
+            crate::vkd3d::swapchain_formats()
+        } else {
+            swapchain_formats()
         }
     }
 
     pub fn create_swapchain(&self, session: u64, ci: &xr::SwapchainCreateInfo) -> Result<SwapchainData, xr::Result> {
+        if let Some(b) = &self.vk {
+            return b.create_swapchain(&self.device, session, ci);
+        }
         let format = DXGI_FORMAT(ci.format as i32);
         let depth = is_depth(format);
         if !depth && !COLOR_FORMATS.contains(&format) {
@@ -553,6 +581,7 @@ impl SessionGfx {
             next_index: 0,
             acquired: Default::default(),
             last_released: None,
+            vk: None,
         })
     }
 
@@ -831,6 +860,28 @@ impl SessionGfx {
     /// Copy the eyes of the projection layer and each quad layer's image into
     /// the shared textures, signal the fence, and tell the window where things are.
     pub fn submit(
+        &mut self,
+        eyes: &[EyeSource],
+        views: &[(xrmimic_core::math::Pose, xrmimic_core::math::Fov)],
+        quads: &[(EyeSource, crate::shared::QuadMeta)],
+        depths: &[(usize, EyeSource, crate::shared::DepthInfo)],
+        frame: u64,
+    ) {
+        // A Vulkan app: its images go into their proxies first (on its queue;
+        // this context waits for that), and the proxies are free again once
+        // the copies below are done.
+        let read = self.vk.as_mut().and_then(|b| {
+            let all: Vec<&EyeSource> =
+                eyes.iter().chain(quads.iter().map(|q| &q.0)).chain(depths.iter().map(|d| &d.1)).collect();
+            b.copy(&all)
+        });
+        self.submit_frame(eyes, views, quads, depths, frame);
+        if let (Some(v), Some(b)) = (read, self.vk.as_mut()) {
+            b.read_done(v);
+        }
+    }
+
+    fn submit_frame(
         &mut self,
         eyes: &[EyeSource],
         views: &[(xrmimic_core::math::Pose, xrmimic_core::math::Fov)],
