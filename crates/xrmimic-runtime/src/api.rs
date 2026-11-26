@@ -145,6 +145,7 @@ pub unsafe extern "system" fn create_instance(
     out: *mut xr::Instance,
 ) -> xr::Result {
     crate::traced!("xrCreateInstance", [info, out], || {
+        crate::control::start_once();
         let info = &*info;
         let app = read_str(&info.application_info.application_name);
         let engine = read_str(&info.application_info.engine_name);
@@ -962,6 +963,13 @@ pub unsafe extern "system" fn wait_frame(
     state: *mut xr::FrameState,
 ) -> xr::Result {
     crate::traced!("xrWaitFrame", [session, _info, state], || {
+        // Frames the control API holds back wait here, outside the runtime lock.
+        let gate = match rt().sessions.get(&session.into_raw()) {
+            Some(s) if s.running => s.headset.frame_gate(),
+            Some(_) => return xr::Result::ERROR_SESSION_NOT_RUNNING,
+            None => return xr::Result::ERROR_HANDLE_INVALID,
+        };
+        gate.pass();
         let (wake, period, render) = {
             let mut rt = rt();
             let Some(s) = rt.sessions.get_mut(&session.into_raw()) else {

@@ -11,6 +11,7 @@ pub mod time;
 pub mod trace;
 
 mod api;
+mod control;
 mod headset;
 mod devstore;
 mod input;

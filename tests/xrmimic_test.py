@@ -17,7 +17,8 @@ Scenarios that check pictures open the headset window for a few seconds;
 nothing is typed or clicked on the desktop. XRMIMIC_TEST_DLL overrides the
 runtime's path.
 
-Covered: loader negotiation, extensions, instance and system properties, view
+Covered: the control API (XRMIMIC_CONTROL) and the frame-stepped clock
+(XRMIMIC_CLOCK=step), loader negotiation, extensions, instance and system properties, view
 configurations, blend modes, strings and paths, D3D11 requirements, the
 session lifecycle and its events, reference spaces (VIEW, LOCAL, STAGE,
 LOCAL_FLOOR) and STAGE bounds, swapchain formats and their errors, MSAA
@@ -1450,6 +1451,276 @@ def s_haptics_bar():
     return c
 
 
+
+# ---------------------------------------------------------------- the control API and the stepped clock
+
+
+class Control:
+    """The control API of the runtime in this process (XRMIMIC_CONTROL)."""
+
+    def __init__(self, token=None):
+        import urllib.request
+        self.urllib = urllib.request
+        path = os.environ['XRMIMIC_CONTROL_FILE']
+        for _ in range(200):
+            if os.path.exists(path) and open(path).read().strip():
+                break
+            time.sleep(0.01)
+        self.base = 'http://' + open(path).read().strip()
+        self.token = token
+
+    def call(self, method, path, body=None, raw=False, token=None, data=None):
+        import urllib.error
+        if data is None and body is not None:
+            data = json.dumps(body).encode()
+        req = self.urllib.Request(self.base + path, data=data, method=method)
+        if data is not None:
+            req.add_header('Content-Type', 'application/json')
+        tok = self.token if token is None else token
+        if tok:
+            req.add_header('Authorization', 'Bearer ' + tok)
+        try:
+            with self.urllib.urlopen(req, timeout=30) as r:
+                payload = r.read()
+                return r.status, (payload if raw else json.loads(payload))
+        except urllib.error.HTTPError as e:
+            payload = e.read()
+            try:
+                return e.code, json.loads(payload)
+            except ValueError:
+                return e.code, payload
+
+    def get(self, path, **kw):
+        return self.call('GET', path, **kw)
+
+    def post(self, path, body=None, **kw):
+        return self.call('POST', path, {} if body is None else body, **kw)
+
+
+class Background:
+    """Run a control call on another thread while this one renders frames."""
+
+    def __init__(self, fn):
+        import threading
+        self.result = None
+        self.thread = threading.Thread(target=self._run, args=(fn,))
+        self.thread.start()
+
+    def _run(self, fn):
+        self.result = fn()
+
+    def done(self):
+        return not self.thread.is_alive()
+
+
+def frames_until(app, render, done, limit=1200):
+    """Render frames until done() (at least one), at most `limit`."""
+    for i in range(limit):
+        app.frame(lambda v, fs: render(i, v, fs))
+        if done():
+            return i + 1
+    return limit
+
+
+@scenario
+def s_control():
+    """The control API (XRMIMIC_CONTROL): state, head, controller inputs and placing,
+    hands, haptics, captures, waiting for frames, the device, errors."""
+    c = Checks()
+    app = App()
+    app.start()
+    ctl = Control()
+    acts = Actions(app)
+    eyes = eye_swapchains(app)
+    view = app.space(SPACE_VIEW)
+    grips = [acts.grip_space(0), acts.grip_space(1)]
+
+    def render(i, views, fs):
+        acts.sync()
+        paint_eyes(app, eyes, [RED, GREEN])
+        return [app.projection(eyes, views)]
+
+    def run(n):
+        app.run(render, frames=n)
+    run(20)
+    st, state = ctl.get('/v1/state')
+    sess = state.get('session') or {}
+    c.eq('state: 200', st, 200)
+    c.eq('state: session focused', sess.get('state'), 'FOCUSED')
+    c.eq('state: app name', sess.get('app'), 'xrmimic python test')
+    c.eq('state: device', state['device']['name'], 'Oculus Quest2')
+    c.eq('state: interaction profile', sess.get('profile'), '/interaction_profiles/oculus/touch_controller')
+    c.ok('state: bindings listed', ['/user/hand/right/input/trigger/value', 'trigger'] in sess.get('bound', []), len(sess.get('bound', [])))
+    c.ok('state: frames counted', sess.get('frame', 0) >= 20, sess.get('frame'))
+    # Head.
+    st, _ = ctl.post('/v1/head', {'position': [1.0, 1.5, -2.0], 'yaw': 0.5, 'pitch': 0.0})
+    run(3)
+    head = app.locate(view, app.stage).pose
+    c.ok('head moved there (STAGE)', abs(head.position.x - 1.0) < 0.02 and abs(head.position.y - 1.5) < 0.02 and abs(head.position.z + 2.0) < 0.02,
+         (round(head.position.x, 3), round(head.position.y, 3), round(head.position.z, 3)))
+    fwd = qrot((head.orientation.x, head.orientation.y, head.orientation.z, head.orientation.w), (0, 0, -1))
+    c.near('head turned 0.5 rad left', math.atan2(-fwd[0], -fwd[2]), 0.5, 0.01)
+    # Controller inputs: held, merged, replaced.
+    ctl.post('/v1/controller/right', {'input': {'trigger': 0.7, 'button_lower': True}})
+    run(5)
+    c.near('held right trigger reaches the action', acts.float(acts.trigger, 1), 0.7, 0.011)
+    c.ok('held A reaches the action', acts.bool(acts.primary, 1))
+    ctl.post('/v1/controller/right', {'input': {'squeeze': 1.0}})
+    run(5)
+    c.ok('a later request adds to what is held', abs(acts.float(acts.trigger, 1) - 0.7) < 0.011 and abs(acts.float(acts.squeeze, 1) - 1.0) < 0.011,
+         (acts.float(acts.trigger, 1), acts.float(acts.squeeze, 1)))
+    ctl.post('/v1/controller/right', {'input': {}, 'replace': True})
+    run(5)
+    c.near('replace: nothing held', acts.float(acts.trigger, 1), 0.0, 0.011)
+    st, bad = ctl.post('/v1/controller/right', {'input': {'trigga': 1}})
+    c.eq('unknown input refused', st, 400)
+    # Placing a controller.
+    ctl.post('/v1/controller/left', {'put': {'position': [0.2, 1.0, -0.4]}})
+    run(3)
+    g = app.locate(grips[0], app.stage).pose.position
+    c.ok('left controller put down there', abs(g.x - 0.2) < 0.01 and abs(g.y - 1.0) < 0.01 and abs(g.z + 0.4) < 0.01, (round(g.x, 3), round(g.y, 3), round(g.z, 3)))
+    ctl.post('/v1/controller/left', {'put': None})
+    run(3)
+    g = app.locate(grips[0], app.stage).pose.position
+    c.ok('given back to the head', abs(g.z + 0.4) > 0.05 or abs(g.x - 0.2) > 0.05, (round(g.x, 3), round(g.y, 3), round(g.z, 3)))
+    # Haptics, as the app sent them.
+    acts.pulse(1, 0.6, 50_000_000)
+    _, state = ctl.get('/v1/state')
+    hr = state['session']['haptics'][1]
+    c.ok('haptics reported', hr['count'] == 1 and abs(hr['last']['amplitude'] - 0.6) < 1e-3, hr)
+    # Waiting for a frame while frames run.
+    target = state['session']['frame'] + 30
+    w = Background(lambda: ctl.get(f'/v1/wait?frame={target}&timeout_ms=10000'))
+    frames_until(app, render, w.done)
+    w.thread.join()
+    st, wr = w.result
+    c.ok('wait for a frame', st == 200 and wr['ok'] and wr['frame'] >= target, (st, wr))
+    st, wr = ctl.get('/v1/wait?state=STOPPING&timeout_ms=50')
+    c.ok('a wait that times out', st == 408 and not wr['ok'], (st, wr))
+    # Eye capture: the next frame, as the app drew it.
+    w = Background(lambda: ctl.get('/v1/capture/eyes?format=bmp', raw=True))
+    frames_until(app, render, w.done)
+    w.thread.join()
+    st, bmp = w.result
+    if st == 200:
+        path = os.path.join(os.getcwd(), 'eyes.bmp')
+        open(path, 'wb').write(bmp)
+        ew, eh, epx = read_bmp(path)
+        c.colour('eye capture: left eye', epx(ew // 4, eh // 2), rgb(RED))
+        c.colour('eye capture: right eye', epx(3 * ew // 4, eh // 2), rgb(GREEN))
+    else:
+        c.ok('eye capture', False, (st, bmp[:200]))
+    # Window capture as PNG.
+    w = Background(lambda: ctl.get('/v1/capture/window?format=png', raw=True))
+    frames_until(app, render, w.done)
+    w.thread.join()
+    st, png = w.result
+    c.ok('window capture is a PNG', st == 200 and png[:8] == b'\x89PNG\r\n\x1a\n', (st, png[:16]))
+    # Views.
+    st, _ = ctl.post('/v1/views', {'centre': True})
+    c.eq('views', st, 200)
+    # Hands.
+    ctl.post('/v1/hands', {'on': True})
+    run(10)
+    c.eq('hands: the hand profile', acts.profile(1), '/interaction_profiles/ext/hand_interaction_ext')
+    ctl.post('/v1/hands', {'on': False})
+    run(10)
+    c.eq('hands off: Touch again', acts.profile(1), '/interaction_profiles/oculus/touch_controller')
+    # The device: a preset; the play area changes, the app is told.
+    st, d = ctl.post('/v1/device', {'preset': 'index'})
+    c.ok('device preset', st == 200 and d['device'] == 'Valve Index', (st, d))
+    run(10)
+    c.ok('play-area change event', any(e[0] == 'space_change' for e in app.events), app.events[-4:])
+    st, d = ctl.post('/v1/device', {'settings': 'play_area_m=banana'})
+    c.eq('bad device settings refused', st, 400)
+    # Errors.
+    c.eq('unknown request', ctl.get('/v1/nope')[0], 404)
+    c.eq('body not JSON refused', ctl.call('POST', '/v1/head', data=b'{not json')[0], 400)
+    app.stop()
+    return c
+
+
+@scenario
+def s_control_token():
+    """XRMIMIC_CONTROL_TOKEN: requests need it."""
+    c = Checks()
+    app = App()
+    app.start()
+    eyes = eye_swapchains(app)
+    app.run(lambda i, v, fs: (paint_eyes(app, eyes, [RED, GREEN]), [app.projection(eyes, v)])[1], frames=5)
+    ctl = Control()
+    c.eq('without the token: 401', ctl.get('/v1/state', token='')[0], 401)
+    c.eq('wrong token: 401', ctl.get('/v1/state', token='nope')[0], 401)
+    c.eq('with the token: 200', ctl.get('/v1/state', token='s3cret')[0], 200)
+    app.stop()
+    return c
+
+
+@scenario
+def s_stepped():
+    """XRMIMIC_CLOCK=step: display times one period apart, frames faster than real
+    time, the user moves exactly one period per frame; pause, step, resume."""
+    c = Checks()
+    app = App()
+    app.start()
+    ctl = Control()
+    eyes = eye_swapchains(app)
+    view = app.space(SPACE_VIEW)
+    times = []
+
+    def render(i, views, fs):
+        times.append(fs.predictedDisplayTime)
+        paint_eyes(app, eyes, [RED, GREEN])
+        return [app.projection(eyes, views)]
+    start = app.locate(view, app.stage).pose.position
+    t0 = time.perf_counter()
+    n = 180
+    app.run(render, frames=n)
+    wall = time.perf_counter() - t0
+    period = round(1e9 / 90)
+    steps = {b - a for a, b in zip(times, times[1:])}
+    c.ok('display times exactly one period apart', steps == {period} or steps == {period - 1, period, period + 1}, sorted(steps)[:5])
+    end = app.locate(view, app.stage).pose.position
+    walked = start.z - end.z
+    # Walking starts with the first frame; xrWaitFrame steps the user before each frame.
+    c.near('walked exactly frames x period x 1.4 m/s (m)', walked, n * period / 1e9 * 1.4, 0.001)
+    c.ok('frames do not wait for real time (this Python app is the limit)', True, f'{n} frames in {wall:.2f} s')
+    _, state = ctl.get('/v1/state')
+    c.ok('state: stepped clock', state['session']['clock']['stepped'], state['session']['clock'])
+    # Pause, step, resume: the frame loop runs on another thread now.
+    import threading
+    stop = threading.Event()
+    counted = []
+
+    def loop():
+        i = 0
+        while not stop.is_set():
+            app.frame(lambda v, fs: render(i, v, fs))
+            counted.append(1)
+            i += 1
+    t = threading.Thread(target=loop)
+    t.start()
+    time.sleep(0.2)
+    ctl.post('/v1/clock', {'paused': True})
+    time.sleep(0.2)
+    f0 = ctl.get('/v1/state')[1]['session']['frame']
+    time.sleep(0.3)
+    f1 = ctl.get('/v1/state')[1]['session']['frame']
+    c.ok('paused: no frames', f1 - f0 <= 1, (f0, f1))
+    st, r = ctl.post('/v1/clock', {'step': 10, 'wait': True})
+    c.ok('step 10: exactly ten more frames', st == 200 and r['frame'] - f1 in (10, 11), (f1, r))
+    time.sleep(0.2)
+    f2 = ctl.get('/v1/state')[1]['session']['frame']
+    c.ok('still paused after the steps', f2 - r['frame'] <= 1, (r['frame'], f2))
+    ctl.post('/v1/clock', {'paused': False})
+    time.sleep(0.3)
+    f3 = ctl.get('/v1/state')[1]['session']['frame']
+    c.ok('resumed: frames run again', f3 - f2 > 10, (f2, f3))
+    stop.set()
+    t.join(10)
+    app.stop()
+    return c
+
 # ---------------------------------------------------------------- running scenarios
 
 def run_scenario(name):
@@ -1486,6 +1757,9 @@ TESTS = {
     'boundary': ('boundary', {'XRMIMIC_PY_PLAY_AREA': '1.5x1.5'}, True),
     'boundary_without_play_area': ('boundary', {'XRMIMIC_PY_PLAY_AREA': '0', 'XRMIMIC_PY_NO_PLAY_AREA': '1'}, True),
     'haptics_bar': ('haptics_bar', {}, True),
+    'control': ('control', {'XRMIMIC_CONTROL': '127.0.0.1:0'}, True),
+    'control_token': ('control_token', {'XRMIMIC_CONTROL': '127.0.0.1:0', 'XRMIMIC_CONTROL_TOKEN': 's3cret'}, False),
+    'stepped_clock': ('stepped', {'XRMIMIC_CONTROL': '127.0.0.1:0', 'XRMIMIC_CLOCK': 'step', 'XRMIMIC_TEST_MOVE': '1'}, False),
 }
 
 
@@ -1499,6 +1773,8 @@ def child(test):
     env.update(extra)
     env['XRMIMIC_LOG'] = os.path.join(work, 'xrmimic.log')
     env['XRMIMIC_CAPTURE'] = os.path.join(work, 'capture.bmp')
+    if 'XRMIMIC_CONTROL' in env:
+        env['XRMIMIC_CONTROL_FILE'] = os.path.join(work, 'control.txt')
     if picture:
         env['XRMIMIC_TEST_SNAPSHOT'] = os.path.join(work, 'window.bmp')
     else:

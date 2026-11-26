@@ -1,7 +1,7 @@
 //! State the runtime shares with the session's headset thread.
 
 use std::sync::atomic::AtomicBool;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use xrmimic_core::math::Pose;
 
 /// How a layer's colours combine with what is under it.
@@ -89,4 +89,27 @@ pub struct Shared {
     pub haptics: Mutex<[xrmimic_core::haptics::HapticState; 2]>,
     /// The app has attached its action sets.
     pub attached: AtomicBool,
+    /// Inputs the control API holds on each hand (crate::control).
+    pub control_input: Mutex<[xrmimic_core::sim::ControllerInput; 2]>,
+    /// The frame-stepped clock steps the simulated user per frame; its
+    /// thread then leaves it alone (crate::headset).
+    pub stepped: AtomicBool,
+    /// Frames held back or handed out by the control API (crate::headset).
+    pub gate: Arc<crate::headset::FrameGate>,
+    /// Window views the control API asked for: Depth, Centre, Reproject.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub view_request: Mutex<[Option<bool>; 3]>,
+    /// Pictures the control API is waiting for: the next frame's eyes (both
+    /// side by side) and the window.
+    pub eye_requests: Mutex<Vec<std::sync::mpsc::Sender<Result<Image, String>>>>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub window_requests: Mutex<Vec<std::sync::mpsc::Sender<Result<Image, String>>>>,
+}
+
+/// A picture: rows top down, 4 bytes a pixel (B, G, R, A).
+#[derive(Clone, Debug)]
+pub struct Image {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
 }

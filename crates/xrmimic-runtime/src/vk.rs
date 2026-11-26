@@ -520,6 +520,10 @@ impl SessionGfx {
         frame: u64,
     ) {
         self.shared.slot.lock().unwrap().frames += 1;
+        // The control API's captures are not read back on Linux yet.
+        for tx in std::mem::take(&mut *self.shared.eye_requests.lock().unwrap()) {
+            let _ = tx.send(Err("eye captures are not available on Linux yet".into()));
+        }
         let Some((path, at)) = &self.capture else { return };
         static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if frame != *at || eyes.is_empty() || TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst) {

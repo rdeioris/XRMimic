@@ -64,23 +64,82 @@ fn env_f32(name: &str) -> f32 {
     std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(0.0)
 }
 
-pub fn spawn(sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> Option<JoinHandle<()>> {
+/// Steps the simulated user with everything that drives it: the window's
+/// keyboard and mouse, the gamepad, the Input tab, the control API, and the
+/// test hooks (XRMIMIC_TEST_TURN / _MOVE / _CONTROLLERS).
+pub struct Driver {
+    test_turn: f32,
+    test_move: f32,
+    test_controllers: bool,
+}
+
+impl Driver {
+    /// Reads the test hooks; XRMIMIC_TEST_HAND_PUT puts the right controller
+    /// down at x,y,z (STAGE) at once, as Ctrl + drags would.
+    pub fn new(sim: &Mutex<SimState>) -> Driver {
+        if let Some(p) = std::env::var("XRMIMIC_TEST_HAND_PUT").ok().and_then(|v| {
+            let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            (n.len() == 3).then(|| xrmimic_core::math::Vec3::new(n[0], n[1], n[2]))
+        }) {
+            sim.lock().unwrap().placed[RIGHT] = Some(xrmimic_core::math::Pose::new(xrmimic_core::math::Quat::IDENTITY, p));
+        }
+        Driver {
+            test_turn: env_f32("XRMIMIC_TEST_TURN"),
+            test_move: env_f32("XRMIMIC_TEST_MOVE"),
+            test_controllers: std::env::var_os("XRMIMIC_TEST_CONTROLLERS").is_some(),
+        }
+    }
+
+    /// One step of `dt` seconds with the input gathered since the last.
+    pub fn step(&self, sim: &Mutex<SimState>, shared: &Shared, dt: f32) {
+        let (mut f, toggle) = shared.input.lock().unwrap().take();
+        let mut s = sim.lock().unwrap();
+        if toggle {
+            s.toggle_active_controller();
+        }
+        // The keyboard drives the active controller.
+        let kb = f.controllers[0];
+        f.controllers = [ControllerInput::default(); 2];
+        f.controllers[s.active_controller] = kb;
+        #[cfg(windows)]
+        {
+            let pad = crate::window::gamepad();
+            for h in [LEFT, RIGHT] {
+                f.controllers[h] = f.controllers[h].merge(pad.controllers[h]);
+            }
+            f.turn_rate += pad.turn_rate;
+            f.move_forward += pad.move_forward;
+            f.move_right += pad.move_right;
+        }
+        // Held inputs: the Input tab's, and the control API's.
+        let tab = *shared.tab_input.lock().unwrap();
+        let control = *shared.control_input.lock().unwrap();
+        for h in [LEFT, RIGHT] {
+            f.controllers[h] = f.controllers[h].merge(tab[h]).merge(control[h]);
+        }
+        f.turn_rate += self.test_turn;
+        f.move_forward += self.test_move;
+        if self.test_controllers {
+            // Right: trigger fully pulled and A held. Left: stick pushed down-right, grip squeezed.
+            let t = [
+                ControllerInput { thumbstick: [0.5, -1.0], squeeze: 1.0, ..Default::default() },
+                ControllerInput { trigger: 1.0, button_lower: true, ..Default::default() },
+            ];
+            for h in [LEFT, RIGHT] {
+                f.controllers[h] = f.controllers[h].merge(t[h]);
+            }
+        }
+        s.step(&f, dt);
+    }
+}
+
+/// The simulated user's thread: steps the user every few milliseconds in
+/// real time, unless the frame-stepped clock steps it per frame instead
+/// (`Shared::stepped`, crate::headset); feeds the gamepad's motors.
+pub fn spawn(sim: Arc<Mutex<SimState>>, shared: Arc<Shared>, driver: Arc<Driver>) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("xrmimic-user".into())
         .spawn(move || {
-            // Tests only: a constant head turn (rad/s) and walk, and held controller input.
-            let test_turn = env_f32("XRMIMIC_TEST_TURN");
-            let test_move = env_f32("XRMIMIC_TEST_MOVE");
-            let test_controllers = std::env::var_os("XRMIMIC_TEST_CONTROLLERS").is_some();
-            // Tests only: the right controller put down at x,y,z (STAGE), as
-            // Ctrl + drags would, so it stays there while the head moves.
-            if let Some(p) = std::env::var("XRMIMIC_TEST_HAND_PUT").ok().and_then(|v| {
-                let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-                (n.len() == 3).then(|| xrmimic_core::math::Vec3::new(n[0], n[1], n[2]))
-            }) {
-                let mut s = sim.lock().unwrap();
-                s.placed[RIGHT] = Some(xrmimic_core::math::Pose::new(xrmimic_core::math::Quat::IDENTITY, p));
-            }
             let mut last = Instant::now();
             // The gamepad's motors follow the hands' haptics: left motor, left hand.
             #[cfg(windows)]
@@ -90,44 +149,9 @@ pub fn spawn(sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> Option<JoinHandl
                 let now = Instant::now();
                 let dt = (now - last).as_secs_f32().min(0.25);
                 last = now;
-                let (mut f, toggle) = shared.input.lock().unwrap().take();
-                let mut s = sim.lock().unwrap();
-                if toggle {
-                    s.toggle_active_controller();
+                if !shared.stepped.load(Ordering::Relaxed) {
+                    driver.step(&sim, &shared, dt);
                 }
-                // The keyboard drives the active controller.
-                let kb = f.controllers[0];
-                f.controllers = [ControllerInput::default(); 2];
-                f.controllers[s.active_controller] = kb;
-                #[cfg(windows)]
-                {
-                    let pad = crate::window::gamepad();
-                    for h in [LEFT, RIGHT] {
-                        f.controllers[h] = f.controllers[h].merge(pad.controllers[h]);
-                    }
-                    f.turn_rate += pad.turn_rate;
-                    f.move_forward += pad.move_forward;
-                    f.move_right += pad.move_right;
-                }
-                // The Input tab's held inputs.
-                let tab = *shared.tab_input.lock().unwrap();
-                for h in [LEFT, RIGHT] {
-                    f.controllers[h] = f.controllers[h].merge(tab[h]);
-                }
-                f.turn_rate += test_turn;
-                f.move_forward += test_move;
-                if test_controllers {
-                    // Right: trigger fully pulled and A held. Left: stick pushed down-right, grip squeezed.
-                    let t = [
-                        ControllerInput { thumbstick: [0.5, -1.0], squeeze: 1.0, ..Default::default() },
-                        ControllerInput { trigger: 1.0, button_lower: true, ..Default::default() },
-                    ];
-                    for h in [LEFT, RIGHT] {
-                        f.controllers[h] = f.controllers[h].merge(t[h]);
-                    }
-                }
-                s.step(&f, dt);
-                drop(s);
                 #[cfg(windows)]
                 {
                     let now = crate::time::now_ns();

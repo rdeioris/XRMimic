@@ -400,6 +400,46 @@ Linux notes:
   previous one in between. The 120 Hz virtual monitor and both ANGLE backends
   gave the same figure.
 
+## Control API and the frame-stepped clock (for tests)
+
+A test can drive the simulated user and read what the app does while it
+runs, over a small HTTP + JSON API in the runtime:
+
+```powershell
+$env:XRMIMIC_CONTROL = "127.0.0.1:8790"     # 127.0.0.1:0 picks a free port
+$env:XRMIMIC_CONTROL_FILE = "$env:TEMP\xrmimic-control.txt"   # where the port taken is written
+$env:XRMIMIC_CLOCK = "step"                  # optional: the frame-stepped clock
+```
+
+| Request | Does |
+| --- | --- |
+| `GET /v1/state` | the device; the newest session's state, frame number, app, interaction profile and bindings, the user (head, eyes, each controller's aim and grip poses, inputs, whether it is put down), haptics, the clock |
+| `POST /v1/head` `{"position": [x, y, z], "yaw": r, "pitch": r}` | move and turn the head (STAGE, metres, radians; any subset) |
+| `POST /v1/controller/left` or `/right` `{"input": {...}, "replace": false, "put": {...}}` | hold inputs (`trigger`, `squeeze`, `thumbstick: [x, y]`, `button_lower` (A/X), `button_upper` (B/Y), `menu`, touches, `trackpad`, `curls: [5]`, `hand_hidden`), added to what is held unless `replace`; `put`: an aim pose `{"position": [...], "orientation": [x, y, z, w]}` to put the controller down at, `null` to give it back to the head |
+| `POST /v1/hands` `{"on": true}` | put the controllers down (tracked hands) or pick them up |
+| `POST /v1/device` `{"preset": "index"}` or `{"settings": "play_area_m=3x3"}` | change the device as the Device tab does |
+| `POST /v1/views` `{"depth": true, "centre": false, "reproject": false}` | the window's views |
+| `POST /v1/clock` `{"paused": true}`, `{"step": 10, "wait": true}`, `{"paused": false}` | hold frames back, let a number through (and wait until the app has ended them), resume |
+| `GET /v1/wait?frame=N&state=FOCUSED&timeout_ms=5000` | until the app has ended frame N and/or the session is in that state (408 on timeout) |
+| `GET /v1/capture/eyes?format=png` (or `bmp`) | the next frame's eyes side by side, as the app drew them |
+| `GET /v1/capture/window?format=png` | the headset window |
+
+`XRMIMIC_CONTROL_TOKEN=<token>` makes every request carry
+`Authorization: Bearer <token>`. The control API's held inputs combine with
+the keyboard, the gamepad and the Input tab like those do with each other.
+
+**Frame-stepped clock** (`XRMIMIC_CLOCK=step`): `xrWaitFrame` does not wait
+for real time; display times advance exactly one period per frame, and the
+simulated user moves exactly one period per frame (its walk, turn and the
+control API's moves), so a run comes out the same every time and as fast as
+the app renders. With `POST /v1/clock {"paused": true}` frames wait until the
+test lets them through, one or many at a time.
+
+The server runs inside the app's process, so it is not available inside
+Chrome's sandbox (an AppContainer cannot listen on a port). The Python
+suite's `control`, `control_token` and `stepped_clock` tests use the
+API end to end.
+
 ## Tests
 
 ```powershell

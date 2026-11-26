@@ -1,29 +1,24 @@
-//! The "headset" on Linux: no window. The simulated user's thread moves the
-//! head and controllers; only the test hooks (`XRMIMIC_TEST_*`) drive it.
+//! The "headset" on Linux: no window. The simulated user's thread (started by
+//! crate::headset) moves the head and controllers; the test hooks
+//! (`XRMIMIC_TEST_*`) and the control API drive it.
 
 use crate::shared::Shared;
 use crate::xlog;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use xrmimic_core::sim::SimState;
 
 pub struct Window {
     shared: Arc<Shared>,
-    user: Option<JoinHandle<()>>,
 }
 
 impl Window {
-    pub fn spawn(_gfx: &crate::gfx::SessionGfx, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> Window {
+    pub fn spawn(_gfx: &crate::gfx::SessionGfx, _sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> Window {
         xlog!("headless headset (no display on this platform)");
-        let user = crate::simthread::spawn(sim, shared.clone());
-        Window { shared, user }
+        Window { shared }
     }
 
-    pub fn stop(mut self) {
+    pub fn stop(self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        if let Some(t) = self.user.take() {
-            let _ = t.join();
-        }
     }
 }

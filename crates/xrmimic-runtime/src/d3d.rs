@@ -952,10 +952,20 @@ impl SessionGfx {
                 static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 // Once per process: the first session's frame is the one tests check.
                 if frame == *at && !TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    match capture_bmp(&self.device, &self.context, &c.texs[k], path) {
+                    let written = read_image(&self.device, &self.context, &c.texs[k])
+                        .and_then(|i| crate::log::write_bmp(path, i.width, i.height, &i.bgra).map_err(|e| e.to_string()));
+                    match written {
                         Ok(()) => xlog!("captured frame {frame} to {}", path.display()),
                         Err(e) => xlog!("capture failed: {e}"),
                     }
+                }
+            }
+            // The control API's captures: this frame's eyes, side by side.
+            let waiting = std::mem::take(&mut *self.shared.eye_requests.lock().unwrap());
+            if !waiting.is_empty() {
+                let image = read_image(&self.device, &self.context, &c.texs[k]);
+                for tx in waiting {
+                    let _ = tx.send(image.clone());
                 }
             }
             c.value += 1;
@@ -1000,12 +1010,12 @@ impl SessionGfx {
 }
 
 
-unsafe fn capture_bmp(
+/// An 8-bit RGBA or BGRA texture read back, rows top down (B, G, R, 255).
+unsafe fn read_image(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     tex: &ID3D11Texture2D,
-    path: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<crate::shared::Image, String> {
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     tex.GetDesc(&mut desc);
     let bgra = matches!(desc.Format, DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
@@ -1038,5 +1048,5 @@ unsafe fn capture_bmp(
         }
     }
     context.Unmap(&staging, 0);
-    crate::log::write_bmp(path, w as u32, h as u32, &px).map_err(|e| e.to_string())
+    Ok(crate::shared::Image { width: w as u32, height: h as u32, bgra: px })
 }

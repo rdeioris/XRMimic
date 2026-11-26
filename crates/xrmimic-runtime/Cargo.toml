@@ -12,6 +12,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 openxr-sys = "0.14"
 xrmimic-core = { path = "../xrmimic-core" }
+# The control API (crate::control): HTTP, JSON, PNG captures.
+tiny_http = "0.12"
+serde_json = "1"
+png = "0.17"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

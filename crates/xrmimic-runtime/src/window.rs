@@ -28,13 +28,11 @@ use xrmimic_core::sim::{ControllerInput, InputFrame, SimState, LEFT, RIGHT};
 pub struct Window {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
-    user: Option<JoinHandle<()>>,
 }
 
 impl Window {
     pub fn spawn(gfx: &crate::gfx::SessionGfx, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> Window {
         let luid = gfx.luid;
-        let user = crate::simthread::spawn(sim.clone(), shared.clone());
         let s = shared.clone();
         let luid = (luid.LowPart, luid.HighPart);
         let thread = std::thread::Builder::new()
@@ -46,12 +44,12 @@ impl Window {
                 }
             })
             .ok();
-        Window { shared, thread, user }
+        Window { shared, thread }
     }
 
     pub fn stop(mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        for t in [self.thread.take(), self.user.take()].into_iter().flatten() {
+        if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
     }
@@ -1822,6 +1820,21 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
                 std::thread::sleep(std::time::Duration::from_millis(8));
             }
 
+            // The control API: views to switch, pictures of the window to take.
+            let views = std::mem::take(&mut *shared.view_request.lock().unwrap());
+            for (b, want) in [depth_box, centre_box, reproject_box].into_iter().zip(views) {
+                if let Some(on) = want {
+                    SendMessageW(b, BM_SETCHECK, Some(WPARAM(on as usize)), None);
+                }
+            }
+            let waiting = std::mem::take(&mut *shared.window_requests.lock().unwrap());
+            if !waiting.is_empty() {
+                let image = window_image(hwnd);
+                for tx in waiting {
+                    let _ = tx.send(image.clone());
+                }
+            }
+
             if let Some(path) = &snapshot {
                 // Shortly after the first frame arrives, once.
                 if frames > 0 && snapshot_at.is_none() {
@@ -1872,6 +1885,12 @@ fn run(luid: LUID, sim: Arc<Mutex<SimState>>, shared: Arc<Shared>) -> windows::c
 
 /// The window's client area (toolbar and eyes) as a BMP, via PrintWindow.
 unsafe fn snapshot_window(hwnd: HWND, path: &std::path::Path) -> Result<(), String> {
+    let i = window_image(hwnd)?;
+    crate::log::write_bmp(path, i.width, i.height, &i.bgra).map_err(|e| e.to_string())
+}
+
+/// The window's client area (toolbar and eyes) as a picture, via PrintWindow.
+unsafe fn window_image(hwnd: HWND) -> Result<crate::shared::Image, String> {
     use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
     let mut r = RECT::default();
@@ -1907,7 +1926,7 @@ unsafe fn snapshot_window(hwnd: HWND, path: &std::path::Path) -> Result<(), Stri
     if !ok {
         return Err("PrintWindow failed".into());
     }
-    crate::log::write_bmp(path, w as u32, h as u32, &px).map_err(|e| e.to_string())
+    Ok(crate::shared::Image { width: w as u32, height: h as u32, bgra: px })
 }
 
 /// Keyboard and mouse to an input frame; controller input goes in slot 0 and
