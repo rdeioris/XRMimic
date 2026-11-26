@@ -158,6 +158,14 @@ fn depth_formats(f: DXGI_FORMAT) -> Option<(DXGI_FORMAT, DXGI_FORMAT)> {
     }
 }
 
+/// Depth images the window cannot get a plain copy of: MSAA ones, and
+/// D32_FLOAT_S8X24_UINT (Unity's 24-bit depth on D3D11), whose typeless
+/// format cannot be a shared texture. Their depth is drawn into an R32_FLOAT
+/// ring instead (sample 0 for MSAA).
+fn depth_drawn(format: DXGI_FORMAT, sample_count: u32) -> bool {
+    sample_count > 1 || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+}
+
 /// One quad layer as the window sees it: its own ring of shared textures
 /// (same ring index and fence as the eyes) and where to draw it.
 #[derive(Clone)]
@@ -195,11 +203,16 @@ pub const COLOR_FORMATS: [DXGI_FORMAT; 5] = [
     DXGI_FORMAT_B8G8R8A8_UNORM,
     DXGI_FORMAT_R16G16B16A16_FLOAT,
 ];
-pub const DEPTH_FORMATS: [DXGI_FORMAT; 3] =
-    [DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D16_UNORM];
+pub const DEPTH_FORMATS: [DXGI_FORMAT; 4] = [
+    DXGI_FORMAT_D24_UNORM_S8_UINT,
+    DXGI_FORMAT_D32_FLOAT,
+    DXGI_FORMAT_D16_UNORM,
+    // Unity's OpenXR plugin asks for this one in its 24-bit depth mode.
+    DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+];
 
 pub fn is_depth(f: DXGI_FORMAT) -> bool {
-    DEPTH_FORMATS.contains(&f) || f == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+    DEPTH_FORMATS.contains(&f)
 }
 
 /// Adapter the runtime asks apps to use: the first hardware adapter.
@@ -316,16 +329,20 @@ pub struct EyeSource {
 struct DepthResolver {
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
+    /// The same for a single-sample image (`ps1`).
+    ps1: ID3D11PixelShader,
     state: ID3DDeviceContextState,
 }
 
 const DEPTH_RESOLVE: &str = r#"
 Texture2DMSArray<float> d : register(t0);
+Texture2DArray<float> d1 : register(t0);
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 float ps(float4 p : SV_Position) : SV_Target { return d.Load(int3(p.xy, 0), 0); }
+float ps1(float4 p : SV_Position) : SV_Target { return d1.Load(int4(p.xy, 0, 0)); }
 "#;
 
 unsafe fn compile(src: &str, entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Option<Vec<u8>> {
@@ -348,9 +365,11 @@ impl DepthResolver {
         use windows::core::s;
         let vs_code = compile(DEPTH_RESOLVE, s!("vs"), s!("vs_5_0"))?;
         let ps_code = compile(DEPTH_RESOLVE, s!("ps"), s!("ps_5_0"))?;
-        let (mut vs, mut ps) = (None, None);
+        let ps1_code = compile(DEPTH_RESOLVE, s!("ps1"), s!("ps_5_0"))?;
+        let (mut vs, mut ps, mut ps1) = (None, None, None);
         device.CreateVertexShader(&vs_code, None, Some(&mut vs)).ok()?;
         device.CreatePixelShader(&ps_code, None, Some(&mut ps)).ok()?;
+        device.CreatePixelShader(&ps1_code, None, Some(&mut ps1)).ok()?;
         let device1: ID3D11Device1 = device.cast().ok()?;
         let mut state = None;
         let level = device.GetFeatureLevel();
@@ -360,7 +379,7 @@ impl DepthResolver {
             xlog!("CreateDeviceContextState failed: {e:?}");
             return None;
         }
-        Some(DepthResolver { vs: vs?, ps: ps?, state: state? })
+        Some(DepthResolver { vs: vs?, ps: ps?, ps1: ps1?, state: state? })
     }
 }
 
@@ -474,6 +493,12 @@ impl SessionGfx {
         for _ in 0..3 {
             let mut tex = None;
             let mut r = unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex)) };
+            if r.is_err() && desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32 != 0 {
+                // Cube maps cannot have NT handles; a legacy shared handle still works.
+                xlog!("NT-handle shared texture creation failed ({r:?}); retrying with a legacy shared handle");
+                desc.MiscFlags = cube_flag | D3D11_RESOURCE_MISC_SHARED.0 as u32;
+                r = unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex)) };
+            }
             if r.is_err() && desc.MiscFlags != cube_flag {
                 xlog!("shared texture creation failed ({r:?}); retrying unshared");
                 desc.MiscFlags = cube_flag;
@@ -616,7 +641,7 @@ impl SessionGfx {
             for _ in 0..RING {
                 let mut tex = None;
                 if let Err(e) = self.device.CreateTexture2D(&desc, None, Some(&mut tex)) {
-                    xlog!("quad texture failed: {e:?}");
+                    xlog!("quad texture failed ({w}x{h}, format {}, bind {bind:#x}): {e:?}", format.0);
                     return None;
                 }
                 let tex = tex?;
@@ -669,8 +694,8 @@ impl SessionGfx {
         Some((dst, 0))
     }
 
-    /// Sample 0 of an MSAA depth image's slice into `dst` (R32_FLOAT, the
-    /// whole image's size), through a typeless copy kept for `slot`.
+    /// The depth of an image's slice (sample 0 if MSAA) into `dst`
+    /// (R32_FLOAT, the whole image's size), through a typeless copy kept for `slot`.
     fn resolve_depth(&mut self, slot: usize, src: &EyeSource, dst: &ID3D11Texture2D) -> Option<()> {
         let (typeless, read) = depth_formats(src.format)?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -711,12 +736,29 @@ impl SessionGfx {
         let r = self.depth_resolver.as_ref()?;
         unsafe {
             self.context.CopyResource(&copy, &src.texture);
-            let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
-                Format: read,
-                ViewDimension: windows::Win32::Graphics::Direct3D::D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY,
-                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                    Texture2DMSArray: D3D11_TEX2DMS_ARRAY_SRV { FirstArraySlice: src.subresource, ArraySize: 1 },
-                },
+            let ms = desc.SampleDesc.Count > 1;
+            let srv_desc = if ms {
+                D3D11_SHADER_RESOURCE_VIEW_DESC {
+                    Format: read,
+                    ViewDimension: windows::Win32::Graphics::Direct3D::D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY,
+                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2DMSArray: D3D11_TEX2DMS_ARRAY_SRV { FirstArraySlice: src.subresource, ArraySize: 1 },
+                    },
+                }
+            } else {
+                // A single-sample subresource index is mip + slice * mips; depth has one mip.
+                D3D11_SHADER_RESOURCE_VIEW_DESC {
+                    Format: read,
+                    ViewDimension: windows::Win32::Graphics::Direct3D::D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
+                    Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
+                            MostDetailedMip: 0,
+                            MipLevels: 1,
+                            FirstArraySlice: src.subresource / desc.MipLevels.max(1),
+                            ArraySize: 1,
+                        },
+                    },
+                }
             };
             let mut srv = None;
             self.device.CreateShaderResourceView(&copy, Some(&srv_desc), Some(&mut srv)).ok()?;
@@ -737,7 +779,7 @@ impl SessionGfx {
             }]));
             c.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             c.VSSetShader(&r.vs, None);
-            c.PSSetShader(&r.ps, None);
+            c.PSSetShader(if ms { &r.ps } else { &r.ps1 }, None);
             c.PSSetShaderResources(0, Some(&[srv]));
             c.Draw(3, 0);
             c.PSSetShaderResources(0, Some(&[None]));
@@ -767,7 +809,7 @@ impl SessionGfx {
         // MSAA depth images: sample 0 drawn into R32_FLOAT rings instead.
         for (i, (_, src, _)) in depths.iter().enumerate() {
             let Some((typeless, _)) = depth_formats(src.format) else { continue };
-            let msaa = src.sample_count > 1;
+            let msaa = depth_drawn(src.format, src.sample_count);
             let ring_format = if msaa { DXGI_FORMAT_R32_FLOAT } else { typeless };
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             unsafe { src.texture.GetDesc(&mut desc) };
@@ -816,7 +858,7 @@ impl SessionGfx {
         // MSAA depth: sample 0 into this frame's ring texture.
         let mut resolved_depth = vec![false; depths.len()];
         for (i, (_, src, _)) in depths.iter().enumerate() {
-            if src.sample_count > 1 {
+            if depth_drawn(src.format, src.sample_count) {
                 if let Some(Some(r)) = self.depth_rings.get(i) {
                     let dst = r.texs[k].clone();
                     resolved_depth[i] = self.resolve_depth(i, src, &dst).is_some();
@@ -867,8 +909,8 @@ impl SessionGfx {
             }
             for (i, (_, src, _)) in depths.iter().enumerate() {
                 if let Some(Some(r)) = self.depth_rings.get(i) {
-                    if src.sample_count == 1 && depth_formats(src.format).is_some() {
-                        // (MSAA ones were drawn in above.)
+                    if !depth_drawn(src.format, src.sample_count) && depth_formats(src.format).is_some() {
+                        // (MSAA and D32S8 ones were drawn in above.)
                         self.context.CopySubresourceRegion(&r.texs[k], 0, 0, 0, 0, &src.texture, src.subresource, None);
                     }
                 }
@@ -910,7 +952,7 @@ impl SessionGfx {
             .filter_map(|(i, (eye, src, info))| {
                 let r = self.depth_rings.get(i)?.as_ref()?;
                 let (_, read) = depth_formats(src.format)?;
-                let msaa = src.sample_count > 1;
+                let msaa = depth_drawn(src.format, src.sample_count);
                 (!msaa || resolved_depth[i]).then(|| DepthSlot {
                     eye: *eye,
                     handles: r.handles.iter().map(|h| h.0 as usize).collect(),
