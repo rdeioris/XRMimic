@@ -104,7 +104,11 @@ picture, when the app sends one with its projection layer
 at the eye, mid grey at 2 m, darker further away. Ordinary, reversed and
 infinite depth ranges are read as the app declares them. Neither Chrome 157
 (Windows) nor Chrome 158 (Linux) enables the extension, so only native OpenXR
-apps fill it.
+apps fill it. Unity on D3D11 (its OpenXR plugin with URP) submits depth
+upside down relative to its colour; XRMimic reads it flipped for apps whose
+engine is "Unity", so the Depth, Centre and Reproject views and depth-tested
+layers line up (the log says so). `XRMIMIC_DEPTH_FLIP=1` or `0` forces it on or
+off for any app.
 
 **Centre** (toolbar checkbox): one undistorted picture from a camera halfway
 between the eyes instead of the two eye images, for screenshots, recordings

@@ -491,6 +491,18 @@ pub unsafe extern "system" fn create_session(
         {
             gfx.srgb_as_unorm =
                 rt.instances.get(&instance.into_raw()).is_some_and(|i| i.engine == "Chromium");
+            // Unity on D3D11 (URP, single- and multi-pass, OpenXR plugin 1.17)
+            // submits depth upside down relative to its colour: read it flipped.
+            // XRMIMIC_DEPTH_FLIP=0 or 1 overrides the guess for any app.
+            let unity = rt.instances.get(&instance.into_raw()).is_some_and(|i| i.engine == "Unity");
+            gfx.depth_flipped = match std::env::var("XRMIMIC_DEPTH_FLIP").as_deref() {
+                Ok("1") => true,
+                Ok("0") => false,
+                _ => unity,
+            };
+            if gfx.depth_flipped {
+                xlog!("depth images are read upside down (engine Unity, or XRMIMIC_DEPTH_FLIP=1)");
+            }
         }
         let app = rt.instances.get(&instance.into_raw()).map(|i| i.app_name.clone()).unwrap_or_default();
         *shared.app_name.lock().unwrap() = app;

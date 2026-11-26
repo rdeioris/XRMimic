@@ -158,12 +158,12 @@ fn depth_formats(f: DXGI_FORMAT) -> Option<(DXGI_FORMAT, DXGI_FORMAT)> {
     }
 }
 
-/// Depth images the window cannot get a plain copy of: MSAA ones, and
+/// Depth images the window cannot get a plain copy of: MSAA ones,
 /// D32_FLOAT_S8X24_UINT (Unity's 24-bit depth on D3D11), whose typeless
-/// format cannot be a shared texture. Their depth is drawn into an R32_FLOAT
-/// ring instead (sample 0 for MSAA).
-fn depth_drawn(format: DXGI_FORMAT, sample_count: u32) -> bool {
-    sample_count > 1 || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+/// format cannot be a shared texture, and upside-down ones (`flipped`). Their
+/// depth is drawn into an R32_FLOAT ring instead (sample 0 for MSAA).
+fn depth_drawn(format: DXGI_FORMAT, sample_count: u32, flipped: bool) -> bool {
+    flipped || sample_count > 1 || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT
 }
 
 /// One quad layer as the window sees it: its own ring of shared textures
@@ -276,6 +276,9 @@ pub struct SessionGfx {
     pub shared: Arc<Shared>,
     /// sRGB colour swapchains are made as typed UNORM textures (Chromium).
     pub srgb_as_unorm: bool,
+    /// The app's depth images are upside down relative to its colour (Unity
+    /// on D3D11): they are read flipped, so the views that use depth line up.
+    pub depth_flipped: bool,
     compositor: Option<Compositor>,
     generation: u64,
     quad_rings: Vec<QuadRing>,
@@ -331,6 +334,9 @@ struct DepthResolver {
     ps: ID3D11PixelShader,
     /// The same for a single-sample image (`ps1`).
     ps1: ID3D11PixelShader,
+    /// Both again, reading the image upside down (`ps_flip`, `ps1_flip`).
+    ps_flip: ID3D11PixelShader,
+    ps1_flip: ID3D11PixelShader,
     state: ID3DDeviceContextState,
 }
 
@@ -343,6 +349,18 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
 }
 float ps(float4 p : SV_Position) : SV_Target { return d.Load(int3(p.xy, 0), 0); }
 float ps1(float4 p : SV_Position) : SV_Target { return d1.Load(int4(p.xy, 0, 0)); }
+float ps_flip(float4 p : SV_Position) : SV_Target {
+    uint w, h, n, s;
+    d.GetDimensions(w, h, n, s);
+    int2 q = int2(p.xy);
+    return d.Load(int3(q.x, h - 1 - q.y, 0), 0);
+}
+float ps1_flip(float4 p : SV_Position) : SV_Target {
+    uint w, h, n, m;
+    d1.GetDimensions(0, w, h, n, m);
+    int2 q = int2(p.xy);
+    return d1.Load(int4(q.x, h - 1 - q.y, 0, 0));
+}
 "#;
 
 unsafe fn compile(src: &str, entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Option<Vec<u8>> {
@@ -366,7 +384,11 @@ impl DepthResolver {
         let vs_code = compile(DEPTH_RESOLVE, s!("vs"), s!("vs_5_0"))?;
         let ps_code = compile(DEPTH_RESOLVE, s!("ps"), s!("ps_5_0"))?;
         let ps1_code = compile(DEPTH_RESOLVE, s!("ps1"), s!("ps_5_0"))?;
-        let (mut vs, mut ps, mut ps1) = (None, None, None);
+        let ps_flip_code = compile(DEPTH_RESOLVE, s!("ps_flip"), s!("ps_5_0"))?;
+        let ps1_flip_code = compile(DEPTH_RESOLVE, s!("ps1_flip"), s!("ps_5_0"))?;
+        let (mut vs, mut ps, mut ps1, mut ps_flip, mut ps1_flip) = (None, None, None, None, None);
+        device.CreatePixelShader(&ps_flip_code, None, Some(&mut ps_flip)).ok()?;
+        device.CreatePixelShader(&ps1_flip_code, None, Some(&mut ps1_flip)).ok()?;
         device.CreateVertexShader(&vs_code, None, Some(&mut vs)).ok()?;
         device.CreatePixelShader(&ps_code, None, Some(&mut ps)).ok()?;
         device.CreatePixelShader(&ps1_code, None, Some(&mut ps1)).ok()?;
@@ -379,7 +401,7 @@ impl DepthResolver {
             xlog!("CreateDeviceContextState failed: {e:?}");
             return None;
         }
-        Some(DepthResolver { vs: vs?, ps: ps?, ps1: ps1?, state: state? })
+        Some(DepthResolver { vs: vs?, ps: ps?, ps1: ps1?, ps_flip: ps_flip?, ps1_flip: ps1_flip?, state: state? })
     }
 }
 
@@ -411,6 +433,7 @@ impl SessionGfx {
             luid,
             shared,
             srgb_as_unorm: false,
+            depth_flipped: false,
             compositor: None,
             generation: 0,
             quad_rings: Vec::new(),
@@ -779,7 +802,13 @@ impl SessionGfx {
             }]));
             c.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             c.VSSetShader(&r.vs, None);
-            c.PSSetShader(if ms { &r.ps } else { &r.ps1 }, None);
+            let shader = match (ms, self.depth_flipped) {
+                (true, false) => &r.ps,
+                (false, false) => &r.ps1,
+                (true, true) => &r.ps_flip,
+                (false, true) => &r.ps1_flip,
+            };
+            c.PSSetShader(shader, None);
             c.PSSetShaderResources(0, Some(&[srv]));
             c.Draw(3, 0);
             c.PSSetShaderResources(0, Some(&[None]));
@@ -804,12 +833,13 @@ impl SessionGfx {
         if eyes.is_empty() {
             return;
         }
+        let flipped = self.depth_flipped;
         // Depth rings: typeless textures the size of the app's whole depth
         // image (a depth copy must take the whole subresource).
         // MSAA depth images: sample 0 drawn into R32_FLOAT rings instead.
         for (i, (_, src, _)) in depths.iter().enumerate() {
             let Some((typeless, _)) = depth_formats(src.format) else { continue };
-            let msaa = depth_drawn(src.format, src.sample_count);
+            let msaa = depth_drawn(src.format, src.sample_count, flipped);
             let ring_format = if msaa { DXGI_FORMAT_R32_FLOAT } else { typeless };
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             unsafe { src.texture.GetDesc(&mut desc) };
@@ -858,7 +888,7 @@ impl SessionGfx {
         // MSAA depth: sample 0 into this frame's ring texture.
         let mut resolved_depth = vec![false; depths.len()];
         for (i, (_, src, _)) in depths.iter().enumerate() {
-            if depth_drawn(src.format, src.sample_count) {
+            if depth_drawn(src.format, src.sample_count, flipped) {
                 if let Some(Some(r)) = self.depth_rings.get(i) {
                     let dst = r.texs[k].clone();
                     resolved_depth[i] = self.resolve_depth(i, src, &dst).is_some();
@@ -909,7 +939,7 @@ impl SessionGfx {
             }
             for (i, (_, src, _)) in depths.iter().enumerate() {
                 if let Some(Some(r)) = self.depth_rings.get(i) {
-                    if !depth_drawn(src.format, src.sample_count) && depth_formats(src.format).is_some() {
+                    if !depth_drawn(src.format, src.sample_count, flipped) && depth_formats(src.format).is_some() {
                         // (MSAA and D32S8 ones were drawn in above.)
                         self.context.CopySubresourceRegion(&r.texs[k], 0, 0, 0, 0, &src.texture, src.subresource, None);
                     }
@@ -952,7 +982,7 @@ impl SessionGfx {
             .filter_map(|(i, (eye, src, info))| {
                 let r = self.depth_rings.get(i)?.as_ref()?;
                 let (_, read) = depth_formats(src.format)?;
-                let msaa = depth_drawn(src.format, src.sample_count);
+                let msaa = depth_drawn(src.format, src.sample_count, flipped);
                 (!msaa || resolved_depth[i]).then(|| DepthSlot {
                     eye: *eye,
                     handles: r.handles.iter().map(|h| h.0 as usize).collect(),
