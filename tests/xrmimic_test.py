@@ -112,6 +112,7 @@ T_COMPOSITION_LAYER_EQUIRECT2_KHR = 1000091000
 T_COMPOSITION_LAYER_DEPTH_TEST_FB = 1000212000
 
 SPACE_VIEW, SPACE_LOCAL, SPACE_STAGE, SPACE_LOCAL_FLOOR = 1, 2, 3, 1000426000
+SPACE_UNBOUNDED_MSFT = 1000038000
 STATE_NAMES = ['UNKNOWN', 'IDLE', 'READY', 'SYNCHRONIZED', 'VISIBLE', 'FOCUSED', 'STOPPING', 'LOSS_PENDING', 'EXITING']
 BOOLEAN_INPUT, FLOAT_INPUT, VECTOR2F_INPUT, POSE_INPUT, VIBRATION_OUTPUT = 1, 2, 3, 4, 100
 EYES_BOTH, EYES_LEFT = 0, 1
@@ -436,6 +437,7 @@ class Swapchain:
 
 DEFAULT_EXTENSIONS = [
     'XR_KHR_D3D11_enable', 'XR_KHR_win32_convert_performance_counter_time', 'XR_EXT_local_floor',
+    'XR_MSFT_unbounded_reference_space',
     'XR_KHR_composition_layer_cylinder', 'XR_KHR_composition_layer_equirect2', 'XR_KHR_composition_layer_cube',
     'XR_KHR_composition_layer_depth', 'XR_FB_composition_layer_depth_test', 'XR_EXT_hand_tracking',
     'XR_EXT_hand_interaction',
@@ -814,11 +816,15 @@ def s_api():
     # Reference spaces.
     spaces = (c_int32 * 8)()
     check(app.f('xrEnumerateReferenceSpaces')(app.session, c_uint32(8), byref(n), spaces))
-    c.ok('reference spaces', {SPACE_VIEW, SPACE_LOCAL, SPACE_STAGE, SPACE_LOCAL_FLOOR} <= set(spaces[:n.value]), list(spaces[:n.value]))
+    c.ok('reference spaces', {SPACE_VIEW, SPACE_LOCAL, SPACE_STAGE, SPACE_LOCAL_FLOOR, SPACE_UNBOUNDED_MSFT} <= set(spaces[:n.value]), list(spaces[:n.value]))
     floor = app.space(SPACE_LOCAL_FLOOR)
     view = app.space(SPACE_VIEW)
     c.near('LOCAL starts at eye height above STAGE', app.locate(app.local, app.stage).pose.position.y, 1.6, 1e-3)
     c.near('LOCAL_FLOOR is on the floor', app.locate(floor, app.stage).pose.position.y, 0.0, 1e-3)
+    unbounded = app.space(SPACE_UNBOUNDED_MSFT)
+    c.near('UNBOUNDED_MSFT starts where the head started, as LOCAL', app.locate(unbounded, app.stage).pose.position.y, 1.6, 1e-3)
+    r = app.f('xrGetReferenceSpaceBoundsRect')(app.session, c_int32(SPACE_UNBOUNDED_MSFT), byref(Extent2Df()))
+    c.eq('UNBOUNDED_MSFT has no bounds', RESULT_NAME.get(r), 'SPACE_BOUNDS_UNAVAILABLE')
     loc = app.locate(view, app.local)
     c.ok('VIEW located, tracked', loc.locationFlags & 3 == 3, loc.locationFlags)
     bounds = Extent2Df()

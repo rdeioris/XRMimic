@@ -622,11 +622,23 @@ pub unsafe extern "system" fn request_exit_session(session: xr::Session) -> xr::
 
 // ---------------------------------------------------------------- spaces
 
-fn session_has_local_floor(rt: &Runtime, session: u64) -> bool {
+fn session_has_extension(rt: &Runtime, session: u64, name: &str) -> bool {
     rt.sessions
         .get(&session)
         .and_then(|s| rt.instances.get(&s.instance))
-        .is_some_and(|i| i.extensions.iter().any(|e| e == "XR_EXT_local_floor"))
+        .is_some_and(|i| i.extensions.iter().any(|e| e == name))
+}
+
+fn session_has_local_floor(rt: &Runtime, session: u64) -> bool {
+    session_has_extension(rt, session, "XR_EXT_local_floor")
+}
+
+/// XR_MSFT_unbounded_reference_space: UNBOUNDED_MSFT, world-locked and
+/// gravity-aligned, with its origin where the head started (as LOCAL, which in
+/// the simulated room never moves either; Windows Mixed Reality and Unity's
+/// XROrigin place it at head height too). No bounds.
+fn session_has_unbounded(rt: &Runtime, session: u64) -> bool {
+    session_has_extension(rt, session, "XR_MSFT_unbounded_reference_space")
 }
 
 pub unsafe extern "system" fn enumerate_reference_spaces(
@@ -648,6 +660,9 @@ pub unsafe extern "system" fn enumerate_reference_spaces(
         if session_has_local_floor(&rt, session.into_raw()) {
             v.push(xr::ReferenceSpaceType::LOCAL_FLOOR);
         }
+        if session_has_unbounded(&rt, session.into_raw()) {
+            v.push(xr::ReferenceSpaceType::UNBOUNDED_MSFT);
+        }
         drop(rt);
         fill(capacity, count, out, &v)
     })
@@ -668,7 +683,8 @@ pub unsafe extern "system" fn create_reference_space(
         let ok = matches!(
             ty,
             xr::ReferenceSpaceType::VIEW | xr::ReferenceSpaceType::LOCAL | xr::ReferenceSpaceType::STAGE
-        ) || (ty == xr::ReferenceSpaceType::LOCAL_FLOOR && session_has_local_floor(&rt, h));
+        ) || (ty == xr::ReferenceSpaceType::LOCAL_FLOOR && session_has_local_floor(&rt, h))
+            || (ty == xr::ReferenceSpaceType::UNBOUNDED_MSFT && session_has_unbounded(&rt, h));
         xlog!("xrCreateReferenceSpace {ty:?}{}", if ok { "" } else { " (unsupported)" });
         if !ok {
             return xr::Result::ERROR_REFERENCE_SPACE_UNSUPPORTED;
@@ -715,7 +731,9 @@ pub fn space_pose(rt: &Runtime, space: u64) -> Option<Pose> {
     let sim = session.sim.lock().unwrap();
     let base = match sp.kind {
         SpaceKind::Reference(xr::ReferenceSpaceType::VIEW) => sim.head_pose(),
-        SpaceKind::Reference(xr::ReferenceSpaceType::LOCAL) => sim.local_space_pose(sim.eye_height_m),
+        SpaceKind::Reference(xr::ReferenceSpaceType::LOCAL | xr::ReferenceSpaceType::UNBOUNDED_MSFT) => {
+            sim.local_space_pose(sim.eye_height_m)
+        }
         SpaceKind::Reference(_) => Pose::IDENTITY, // STAGE and LOCAL_FLOOR: the floor under the start point
         SpaceKind::Action { action, subaction } => {
             crate::input::action_pose(rt, session, &sim, action, subaction)?

@@ -251,11 +251,13 @@ next Enter VR; IPD, field of view and the play area at once.
 
 **Advertised extensions.** The right-hand column ticks which optional OpenXR
 extensions the runtime offers (the graphics binding and sandbox ones are always
-on): `XR_EXT_local_floor`, the Quest 3 / Quest Pro / Reverb G2 controller
+on): `XR_EXT_local_floor`, `XR_MSFT_unbounded_reference_space` (an
+`UNBOUNDED_MSFT` space with its origin where the head started, like LOCAL,
+and no bounds), the Quest 3 / Quest Pro / Reverb G2 controller
 extensions, the cylinder, equirect and cube layer extensions (drawn), the
 depth layer extension (shown by the Depth checkbox, used by Centre and
 Reproject) and depth-tested layers. Each preset ticks the
-floor space, the three layer shapes, depth and its own controllers' extension. Chrome reads the list once per OpenXR instance, which on Windows
+floor and unbounded spaces, the three layer shapes, depth and its own controllers' extension. Chrome reads the list once per OpenXR instance, which on Windows
 lives as long as Chrome, so extension changes apply after restarting Chrome.
 Chrome enables what it knows of the list, and WebXR features follow from that
 and Chrome's version: unticking `XR_EXT_local_floor` does not take `local-floor`

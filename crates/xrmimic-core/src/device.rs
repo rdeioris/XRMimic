@@ -22,6 +22,7 @@ pub const CONTROLLERS: &[(&str, &str, Option<&str>)] = &[
 /// (graphics binding, clock, sandbox): (name, spec version, what xrmimic does with it).
 pub const OPTIONAL_EXTENSIONS: &[(&str, u32, &str)] = &[
     ("XR_EXT_local_floor", 1, "LOCAL_FLOOR space"),
+    ("XR_MSFT_unbounded_reference_space", 1, "UNBOUNDED_MSFT space"),
     ("XR_META_touch_controller_plus", 1, "Quest 3 controller profile"),
     ("XR_FB_touch_controller_pro", 1, "Quest Pro controller profile"),
     ("XR_EXT_hp_mixed_reality_controller", 1, "HP Reverb G2 controller profile"),
@@ -375,12 +376,13 @@ impl DeviceProfile {
     }
 }
 
-/// What a preset advertises: the floor space, cylinder, equirect and cube
+/// What a preset advertises: the floor and unbounded spaces, cylinder, equirect and cube
 /// layers (all drawn by xrmimic), depth with projection layers (shown by the
 /// window's Depth view), and the extension its own controllers need.
 fn default_extensions(controllers: &str) -> Vec<String> {
     let mut v = vec![
         "XR_EXT_local_floor".to_string(),
+        "XR_MSFT_unbounded_reference_space".to_string(),
         "XR_KHR_composition_layer_cylinder".to_string(),
         "XR_KHR_composition_layer_equirect2".to_string(),
         "XR_KHR_composition_layer_cube".to_string(),
@@ -458,6 +460,7 @@ mod tests {
             ext("quest2"),
             vec![
                 "XR_EXT_local_floor",
+                "XR_MSFT_unbounded_reference_space",
                 "XR_KHR_composition_layer_cylinder",
                 "XR_KHR_composition_layer_equirect2",
                 "XR_KHR_composition_layer_cube",
