@@ -17,19 +17,35 @@
 //! the top row to 8 m at the bottom (uploaded row by row, so a copy that
 //! mixes up rows shows), the left eye with ordinary Z (0.1..100 m) and the
 //! right with reversed infinite Z.
+//!
+//! On Linux (no window) the picture comes from the control API instead
+//! (`/v1/capture/window`, with the Depth view on in depth modes), saved at
+//! XRMIMIC_TEST_SNAPSHOT; quads are not composited there, so they are not
+//! checked, and `-- depth24` adds D24_UNORM_S8_UINT (as Godot uses there).
 
-#[cfg(not(windows))]
-fn main() {
-    eprintln!("vk_client checks the Windows headset window; on Linux use the Python suite or Godot");
-}
-
-#[cfg(windows)]
 fn main() {
     let code = unsafe { run() };
     std::process::exit(code);
 }
 
-#[cfg(windows)]
+/// One HTTP request to the control API (`addr` from XRMIMIC_CONTROL_FILE).
+fn http(addr: &str, method: &str, path: &str, body: &str) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    let mut c = std::net::TcpStream::connect(addr.trim())?;
+    write!(
+        c,
+        "{method} {path} HTTP/1.1\r\nHost: xrmimic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )?;
+    let mut out = Vec::new();
+    c.read_to_end(&mut out)?;
+    let split = out.windows(4).position(|w| w == b"\r\n\r\n").map_or(out.len(), |i| i + 4);
+    if !out.starts_with(b"HTTP/1.1 200") && !out.starts_with(b"HTTP/1.0 200") {
+        return Err(std::io::Error::other(String::from_utf8_lossy(&out[split..]).into_owned()));
+    }
+    Ok(out[split..].to_vec())
+}
+
 unsafe fn run() -> i32 {
     use ash::vk;
     use ash::vk::Handle as _;
@@ -42,11 +58,19 @@ unsafe fn run() -> i32 {
     let msaa = args.iter().any(|a| a == "msaa");
     let depth16 = args.iter().any(|a| a == "depth16");
     let d32s8 = args.iter().any(|a| a == "depth32s8");
-    let depth_mode = depth16 || d32s8 || args.iter().any(|a| a == "depth");
+    let d24 = args.iter().any(|a| a == "depth24");
+    let depth_mode = depth16 || d32s8 || d24 || args.iter().any(|a| a == "depth");
+    // Linux: no window to photograph; the picture comes from the control API.
+    let via_api = cfg!(not(windows));
     if depth_mode {
         std::env::set_var("XRMIMIC_TEST_DEPTH_VIEW", "1");
     }
     let snapshot = std::env::var_os("XRMIMIC_TEST_SNAPSHOT").map(std::path::PathBuf::from);
+    let control_file = snapshot.as_ref().map(|s| s.with_extension("addr"));
+    if let (true, Some(f)) = (via_api, &control_file) {
+        std::env::set_var("XRMIMIC_CONTROL", "127.0.0.1:0");
+        std::env::set_var("XRMIMIC_CONTROL_FILE", f);
+    }
     if let Some(s) = &snapshot {
         let _ = std::fs::remove_file(s);
     }
@@ -273,6 +297,8 @@ unsafe fn run() -> i32 {
         vk::Format::D16_UNORM
     } else if d32s8 {
         vk::Format::D32_SFLOAT_S8_UINT
+    } else if d24 {
+        vk::Format::D24_UNORM_S8_UINT
     } else {
         vk::Format::D32_SFLOAT
     };
@@ -374,6 +400,9 @@ unsafe fn run() -> i32 {
                     for _ in 0..EYE {
                         if depth16 {
                             bytes.extend_from_slice(&((z * 65535.0).round() as u16).to_le_bytes());
+                        } else if d24 {
+                            // Uploaded as X8_D24: the depth in the low 24 bits.
+                            bytes.extend_from_slice(&((z * 16_777_215.0).round() as u32).to_le_bytes());
                         } else {
                             bytes.extend_from_slice(&z.to_le_bytes());
                         }
@@ -395,7 +424,7 @@ unsafe fn run() -> i32 {
     };
     // Layout changes take both aspects of a depth/stencil image.
     let depth_aspects =
-        if d32s8 { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
+        if d32s8 || d24 { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
     let depth_range = vk::ImageSubresourceRange { aspect_mask: depth_aspects, ..colour_range };
     let to = |image, range, from: vk::ImageLayout, to: vk::ImageLayout| {
         vk::ImageMemoryBarrier::default()
@@ -441,7 +470,20 @@ unsafe fn run() -> i32 {
     // ------------------------------------------------ frames
     let frame_count = if snapshot.is_some() { 400 } else { 60 * 60 };
     let mut last_views = [xr::View { ty: xr::View::TYPE, next: std::ptr::null_mut(), pose: xr::Posef::IDENTITY, fov: std::mem::zeroed() }; 2];
-    for _ in 0..frame_count {
+    let mut fetch: Option<std::thread::JoinHandle<Result<(), String>>> = None;
+    for frame in 0..frame_count {
+        // Linux: ask the control API for the picture once frames are steady
+        // (on another thread: it is answered by a later xrEndFrame).
+        if let (true, 200, Some(out), Some(file)) = (via_api, frame, snapshot.clone(), control_file.clone()) {
+            fetch = Some(std::thread::spawn(move || {
+                let addr = std::fs::read_to_string(&file).map_err(|e| format!("control file: {e}"))?;
+                if depth_mode {
+                    http(&addr, "POST", "/v1/views", r#"{"depth": true}"#).map_err(|e| format!("views: {e}"))?;
+                }
+                let bmp = http(&addr, "GET", "/v1/capture/window?format=bmp", "").map_err(|e| format!("capture: {e}"))?;
+                std::fs::write(&out, bmp).map_err(|e| e.to_string())
+            }));
+        }
         let mut fs = xr::FrameState { ty: xr::FrameState::TYPE, next: std::ptr::null_mut(), ..std::mem::zeroed() };
         check!(wait_frame(session, std::ptr::null(), &mut fs));
         check!(begin_frame(session, std::ptr::null()));
@@ -577,6 +619,12 @@ unsafe fn run() -> i32 {
         };
         check!(end_frame(session, &fei));
     }
+    if let Some(f) = fetch {
+        if let Err(e) = f.join().unwrap() {
+            eprintln!("FAIL: control API picture: {e}");
+            return 1;
+        }
+    }
     check!(request_exit(session));
     next_state(xr::SessionState::STOPPING);
     check!(end_session(session));
@@ -599,15 +647,17 @@ unsafe fn run() -> i32 {
         let o = 54 + ((y * w + x) * 4) as usize;
         [b[o + 2], b[o + 1], b[o]]
     };
-    // The view sits under the 34 px toolbar, letterboxed to the frame's aspect.
-    let (vw0, vh0) = (w as f32, (h - 34) as f32);
+    // The view sits under the 34 px toolbar, letterboxed to the frame's aspect
+    // (the control API's Linux picture is the eyes alone).
+    let top = if via_api { 0 } else { 34 };
+    let (vw0, vh0) = (w as f32, (h - top) as f32);
     let aspect = 2.0f32;
     let (mut vw, mut vh) = (vw0, vw0 / aspect);
     if vh > vh0 {
         vh = vh0;
         vw = vh0 * aspect;
     }
-    let (x0, y0) = ((vw0 - vw) * 0.5, 34.0 + (vh0 - vh) * 0.5);
+    let (x0, y0) = ((vw0 - vw) * 0.5, top as f32 + (vh0 - vh) * 0.5);
     let at = |e: usize, fx: f32, fy: f32| {
         ((x0 + e as f32 * vw * 0.5 + fx * vw * 0.5).round() as i32, (y0 + fy * vh).round() as i32)
     };
@@ -634,7 +684,7 @@ unsafe fn run() -> i32 {
             expect(format!("{} eye, top half", side[e]), at(e, 0.15, 0.15), patterns[e].0);
             expect(format!("{} eye, bottom half", side[e]), at(e, 0.15, 0.85), patterns[e].1);
         }
-        if !depth_mode {
+        if !depth_mode && !via_api {
             // The quad straight ahead covers the middle of each eye.
             expect(format!("{} eye, blue quad ahead", side[e]), at(e, 0.5 + if e == 0 { 0.02 } else { -0.02 }, 0.5), [0, 0, 255]);
         }
