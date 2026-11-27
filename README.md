@@ -384,8 +384,11 @@ exactly as on Windows. It also offers `XR_KHR_convert_timespec_time` (XrTime
 is `CLOCK_MONOTONIC` in nanoseconds), which LÖVR requires. There is no headset
 window on Linux yet: the user is driven by the `XRMIMIC_TEST_*` hooks and the
 control API, and frames can be checked with `XRMIMIC_CAPTURE` (projection
-colour only). The control API's `/v1/capture/eyes` and `/v1/capture/window`
-are not available on Linux.
+colour only) or the control API. On Linux, `/v1/capture/eyes` reads the
+projection layer's eyes back (not MSAA ones). `/v1/capture/window` gives the
+same picture, or, while the Depth view is on (`POST /v1/views {"depth": true}`
+or `XRMIMIC_TEST_DEPTH_VIEW=1`), each eye's depth as the Windows Depth view
+draws it. Other layers are not composited on Linux.
 
 ```sh
 cargo build --release -p xrmimic-runtime

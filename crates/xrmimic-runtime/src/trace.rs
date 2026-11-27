@@ -14,7 +14,7 @@ use std::time::Instant;
 use xr::Handle as _;
 
 pub const CAPACITY: usize = 50_000;
-const MAX_ARG: usize = 1200;
+const MAX_ARG: usize = 16 * 1024;
 
 pub struct Entry {
     pub seq: u64,

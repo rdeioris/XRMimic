@@ -373,6 +373,9 @@ pub struct SessionGfx {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     pub shared: Arc<Shared>,
     capture: Option<(std::path::PathBuf, u64)>,
+    /// The control API's Depth view (`/v1/views`): window pictures show depth.
+    #[cfg_attr(windows, allow(dead_code))]
+    depth_view: bool,
 }
 
 impl Drop for SessionGfx {
@@ -484,7 +487,8 @@ impl SessionGfx {
         });
         xlog!("session on queue family {} index {}", b.queue_family_index, b.queue_index);
         let physical = vk::PhysicalDevice::from_raw(b.physical_device as u64);
-        Ok(SessionGfx { device, queue, pool, instance: inst, physical, cmd, fence, mem_props, shared, capture })
+        let depth_view = std::env::var_os("XRMIMIC_TEST_DEPTH_VIEW").is_some_and(|v| v != "0");
+        Ok(SessionGfx { device, queue, pool, instance: inst, physical, cmd, fence, mem_props, shared, capture, depth_view })
     }
 
     /// Record commands with `f` and run them on the app's queue, waiting for
@@ -665,166 +669,249 @@ impl SessionGfx {
         })
     }
 
-    /// A frame was submitted. Without a display there is nothing to show; the
-    /// frame is only counted, and read back once when a test asks for it.
+    /// A frame was submitted. Without a display there is nothing to show: the
+    /// frame is counted, read back once for `XRMIMIC_CAPTURE`, and read back
+    /// for the control API's pictures (`/v1/capture/eyes`; `/v1/capture/window`
+    /// gives the same eyes, or their depth as greys while the Depth view is on).
     #[cfg(not(windows))]
     pub fn submit(
         &mut self,
         eyes: &[EyeSource],
         _views: &[(xrmimic_core::math::Pose, xrmimic_core::math::Fov)],
         _quads: &[(EyeSource, crate::shared::QuadMeta)],
-        _depths: &[(usize, EyeSource, crate::shared::DepthInfo)],
+        depths: &[(usize, EyeSource, crate::shared::DepthInfo)],
         frame: u64,
     ) {
         self.shared.slot.lock().unwrap().frames += 1;
-        // The control API's captures are not read back on Linux yet.
-        for tx in std::mem::take(&mut *self.shared.eye_requests.lock().unwrap()) {
-            let _ = tx.send(Err("eye captures are not available on Linux yet".into()));
+        let views = std::mem::take(&mut *self.shared.view_request.lock().unwrap());
+        if let Some(on) = views[0] {
+            self.depth_view = on;
+        }
+        let eye_waiting = std::mem::take(&mut *self.shared.eye_requests.lock().unwrap());
+        let window_waiting = std::mem::take(&mut *self.shared.window_requests.lock().unwrap());
+        if !eye_waiting.is_empty() || !window_waiting.is_empty() {
+            let colour = unsafe { self.read_eyes(eyes) };
+            for tx in eye_waiting {
+                let _ = tx.send(colour.clone());
+            }
+            if !window_waiting.is_empty() {
+                let picture = if self.depth_view { unsafe { self.read_depth_view(depths) } } else { colour };
+                for tx in window_waiting {
+                    let _ = tx.send(picture.clone());
+                }
+            }
         }
         let Some((path, at)) = &self.capture else { return };
         static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if frame != *at || eyes.is_empty() || TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        if eyes.iter().any(|e| e.samples > 1) {
-            xlog!("capture skipped: MSAA eyes are not resolved on Linux");
-            return;
-        }
-        match unsafe { self.capture_bmp(eyes, path) } {
+        let written = unsafe { self.read_eyes(eyes) }
+            .and_then(|i| crate::log::write_bmp(path, i.width, i.height, &i.bgra).map_err(|e| e.to_string()));
+        match written {
             Ok(()) => xlog!("captured frame {frame} to {}", path.display()),
             Err(e) => xlog!("capture failed: {e}"),
         }
     }
 
-    /// Both eyes side by side into a host buffer, then a top-down BMP.
-    unsafe fn capture_bmp(&self, eyes: &[EyeSource], path: &std::path::Path) -> Result<(), String> {
-        let eye_w = eyes.iter().map(|e| e.rect.extent.width as u32).max().unwrap_or(1);
-        let eye_h = eyes.iter().map(|e| e.rect.extent.height as u32).max().unwrap_or(1);
-        let (w, h) = (eye_w * 2, eye_h);
-        let size = (w * h * 4) as u64;
+    /// One array layer's rectangle of an image, read back through a host
+    /// buffer (`texel` bytes per texel of `aspect`); the image is left in `layout`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn read_region(
+        &self,
+        image: vk::Image,
+        layer: u32,
+        rect: xr::Rect2Di,
+        layout: vk::ImageLayout,
+        barrier_aspect: vk::ImageAspectFlags,
+        aspect: vk::ImageAspectFlags,
+        texel: u32,
+    ) -> Result<Vec<u8>, String> {
+        let (w, h) = (rect.extent.width.max(0) as u32, rect.extent.height.max(0) as u32);
+        if w == 0 || h == 0 {
+            return Err("empty image rectangle".into());
+        }
+        let size = (w * h * texel) as u64;
         let d = &self.device;
         let buf = d
-            .create_buffer(
-                &vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_DST),
-                None,
-            )
+            .create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_DST), None)
             .map_err(|e| e.to_string())?;
         let req = d.get_buffer_memory_requirements(buf);
-        let ty = self
+        let Some(ty) = self
             .memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
-            .ok_or("no host-visible memory")?;
-        let mem = d
-            .allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None)
-            .map_err(|e| e.to_string())?;
-        d.bind_buffer_memory(buf, mem, 0).map_err(|e| e.to_string())?;
-
-        // Each (image, layer) moves to TRANSFER_SRC and back once.
-        let mut subs: Vec<(vk::Image, u32)> = Vec::new();
-        for e in eyes.iter().take(2) {
-            if !subs.contains(&(e.image, e.layer)) {
-                subs.push((e.image, e.layer));
+        else {
+            d.destroy_buffer(buf, None);
+            return Err("no host-visible memory".into());
+        };
+        let mem = match d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None) {
+            Ok(m) => m,
+            Err(e) => {
+                d.destroy_buffer(buf, None);
+                return Err(e.to_string());
             }
-        }
-        let barrier = |image, layer, from, to, src, dst| {
-            vk::ImageMemoryBarrier::default()
-                .src_access_mask(src)
-                .dst_access_mask(dst)
-                .old_layout(from)
-                .new_layout(to)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
+        };
+        let result = (|| {
+            d.bind_buffer_memory(buf, mem, 0).map_err(|e| e.to_string())?;
+            let range = vk::ImageSubresourceRange {
+                aspect_mask: barrier_aspect,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: layer,
+                layer_count: 1,
+            };
+            let barrier = |from, to, src, dst| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(src)
+                    .dst_access_mask(dst)
+                    .old_layout(from)
+                    .new_layout(to)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range)
+            };
+            let to_src = [barrier(
+                layout,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+            )];
+            let back = [barrier(
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                layout,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+            )];
+            let region = vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: aspect,
+                    mip_level: 0,
                     base_array_layer: layer,
                     layer_count: 1,
-                })
-        };
-        let to_src: Vec<_> = subs
-            .iter()
-            .map(|&(i, l)| {
-                barrier(
-                    i,
-                    l,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                    vk::AccessFlags::TRANSFER_READ,
-                )
+                },
+                image_offset: vk::Offset3D { x: rect.offset.x, y: rect.offset.y, z: 0 },
+                image_extent: vk::Extent3D { width: w, height: h, depth: 1 },
+            };
+            self.run_once(|d, cmd| {
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_src,
+                );
+                d.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf, &[region]);
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &back,
+                );
             })
-            .collect();
-        let back: Vec<_> = subs
-            .iter()
-            .map(|&(i, l)| {
-                barrier(
-                    i,
-                    l,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_READ,
-                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                )
-            })
-            .collect();
-        let r = self.run_once(|d, cmd| {
-            d.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &to_src,
-            );
-            for (i, e) in eyes.iter().enumerate().take(2) {
-                let region = vk::BufferImageCopy {
-                    buffer_offset: (i as u32 * eye_w * 4) as u64,
-                    buffer_row_length: w,
-                    buffer_image_height: h,
-                    image_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: e.layer,
-                        layer_count: 1,
-                    },
-                    image_offset: vk::Offset3D { x: e.rect.offset.x, y: e.rect.offset.y, z: 0 },
-                    image_extent: vk::Extent3D {
-                        width: e.rect.extent.width as u32,
-                        height: e.rect.extent.height as u32,
-                        depth: 1,
-                    },
-                };
-                d.cmd_copy_image_to_buffer(cmd, e.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf, &[region]);
-            }
-            d.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &back,
-            );
-        });
-        let result = r.map_err(|e| e.to_string()).and_then(|()| {
+            .map_err(|e| e.to_string())?;
             let p = d.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()).map_err(|e| e.to_string())?;
-            let src = std::slice::from_raw_parts(p as *const u8, size as usize);
-            let bgra_in = matches!(eyes[0].format, vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM);
-            let mut px = Vec::with_capacity(size as usize);
-            for c in src.chunks(4) {
-                if bgra_in {
-                    px.extend_from_slice(&[c[0], c[1], c[2], 255]);
-                } else {
-                    px.extend_from_slice(&[c[2], c[1], c[0], 255]);
-                }
-            }
+            let data = std::slice::from_raw_parts(p as *const u8, size as usize).to_vec();
             d.unmap_memory(mem);
-            crate::log::write_bmp(path, w, h, &px).map_err(|e| e.to_string())
-        });
+            Ok(data)
+        })();
         d.destroy_buffer(buf, None);
         d.free_memory(mem, None);
         result
+    }
+
+    /// The projection layer's eyes side by side (BGRA, top row first).
+    unsafe fn read_eyes(&self, eyes: &[EyeSource]) -> Result<crate::shared::Image, String> {
+        if eyes.is_empty() {
+            return Err("the frame has no projection layer".into());
+        }
+        if eyes.iter().any(|e| e.samples > 1) {
+            return Err("MSAA eyes are not resolved on Linux".into());
+        }
+        let eye_w = eyes.iter().map(|e| e.rect.extent.width as usize).max().unwrap_or(1);
+        let eye_h = eyes.iter().map(|e| e.rect.extent.height as usize).max().unwrap_or(1);
+        let w = eye_w * 2;
+        let mut px = vec![0u8; w * eye_h * 4];
+        for (i, e) in eyes.iter().take(2).enumerate() {
+            let data = self.read_region(
+                e.image,
+                e.layer,
+                e.rect,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageAspectFlags::COLOR,
+                4,
+            )?;
+            let bgra_in = matches!(e.format, vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM);
+            let (ew, eh) = (e.rect.extent.width as usize, e.rect.extent.height as usize);
+            for y in 0..eh {
+                for x in 0..ew {
+                    let s = &data[(y * ew + x) * 4..(y * ew + x) * 4 + 4];
+                    let o = (y * w + i * eye_w + x) * 4;
+                    let c = if bgra_in { [s[0], s[1], s[2], 255] } else { [s[2], s[1], s[0], 255] };
+                    px[o..o + 4].copy_from_slice(&c);
+                }
+            }
+        }
+        Ok(crate::shared::Image { width: w as u32, height: eye_h as u32, bgra: px })
+    }
+
+    /// The Depth view as the Windows window draws it: each eye's depth as
+    /// greys, nearer brighter (math::depth_distance, math::depth_shade).
+    unsafe fn read_depth_view(
+        &self,
+        depths: &[(usize, EyeSource, crate::shared::DepthInfo)],
+    ) -> Result<crate::shared::Image, String> {
+        use xrmimic_core::math::{depth_distance, depth_shade};
+        let eyes: Vec<_> = depths.iter().filter(|(v, _, _)| *v < 2).collect();
+        if eyes.is_empty() {
+            return Err("the frame has no depth (XR_KHR_composition_layer_depth)".into());
+        }
+        let eye_w = eyes.iter().map(|(_, e, _)| e.rect.extent.width as usize).max().unwrap_or(1);
+        let eye_h = eyes.iter().map(|(_, e, _)| e.rect.extent.height as usize).max().unwrap_or(1);
+        let w = eye_w * 2;
+        let mut px: Vec<u8> = [0u8, 0, 0, 255].repeat(w * eye_h);
+        for (view, e, info) in eyes {
+            let texel = if e.format == vk::Format::D16_UNORM { 2 } else { 4 };
+            let barrier_aspect = if has_stencil(e.format) {
+                vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+            } else {
+                vk::ImageAspectFlags::DEPTH
+            };
+            let data = self.read_region(
+                e.image,
+                e.layer,
+                e.rect,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                barrier_aspect,
+                vk::ImageAspectFlags::DEPTH,
+                texel,
+            )?;
+            let (ew, eh) = (e.rect.extent.width as usize, e.rect.extent.height as usize);
+            for y in 0..eh {
+                for x in 0..ew {
+                    let i = (y * ew + x) * texel as usize;
+                    let d = match e.format {
+                        vk::Format::D16_UNORM => u16::from_le_bytes([data[i], data[i + 1]]) as f32 / 65535.0,
+                        // Copied out as 32 bits, the depth in the low 24.
+                        vk::Format::D24_UNORM_S8_UINT => {
+                            (u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) & 0xff_ffff) as f32 / 16_777_215.0
+                        }
+                        _ => f32::from_le_bytes(data[i..i + 4].try_into().unwrap()),
+                    };
+                    let g = (depth_shade(depth_distance(d, info.min, info.max, info.near, info.far)) * 255.0).round() as u8;
+                    let o = (y * w + view * eye_w + x) * 4;
+                    px[o..o + 4].copy_from_slice(&[g, g, g, 255]);
+                }
+            }
+        }
+        Ok(crate::shared::Image { width: w as u32, height: eye_h as u32, bgra: px })
     }
 }
