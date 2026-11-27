@@ -412,10 +412,9 @@ impl HeadsetControl for LocalControl {
         request_picture(&self.shared.eye_requests, timeout, "frame")
     }
 
+    // On Linux there is no window: the Vulkan side answers with the eyes, or
+    // their depth while the Depth view is on.
     fn capture_window(&self, timeout: Duration) -> Result<Image, String> {
-        if cfg!(not(windows)) {
-            return Err("no headset window on this platform".into());
-        }
         request_picture(&self.shared.window_requests, timeout, "window picture")
     }
 }
