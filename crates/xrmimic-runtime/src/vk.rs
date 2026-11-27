@@ -26,7 +26,8 @@ const COLOR_FORMATS: &[vk::Format] = &[
     vk::Format::R8G8B8A8_UNORM,
 ];
 #[cfg(not(windows))]
-const DEPTH_FORMATS: &[vk::Format] = &[vk::Format::D24_UNORM_S8_UINT, vk::Format::D32_SFLOAT, vk::Format::D16_UNORM];
+const DEPTH_FORMATS: &[vk::Format] =
+    &[vk::Format::D24_UNORM_S8_UINT, vk::Format::D32_SFLOAT, vk::Format::D16_UNORM, vk::Format::D32_SFLOAT_S8_UINT];
 // Windows: the formats crate::vkd3d has proxies for.
 #[cfg(windows)]
 const COLOR_FORMATS: &[vk::Format] = &[
@@ -508,8 +509,30 @@ impl SessionGfx {
         d.reset_fences(&[self.fence])
     }
 
+    /// The formats offered: those of ours the app's GPU can render to (AMD
+    /// GPUs, for one, have no D24_UNORM_S8_UINT).
     pub fn swapchain_formats(&self) -> Vec<i64> {
-        swapchain_formats()
+        swapchain_formats().into_iter().filter(|&f| self.renders_to(vk::Format::from_raw(f as i32))).collect()
+    }
+
+    /// The app's GPU can make an attachment (colour or depth) of this format.
+    pub(crate) fn renders_to(&self, format: vk::Format) -> bool {
+        let props = unsafe { self.instance.get_physical_device_format_properties(self.physical, format) };
+        let want = if is_depth(format) {
+            vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+        } else {
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT
+        };
+        let ok = props.optimal_tiling_features.contains(want | vk::FormatFeatureFlags::TRANSFER_SRC);
+        if !ok {
+            static LOGGED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+            let mut l = LOGGED.lock().unwrap();
+            if !l.contains(&format.as_raw()) {
+                l.push(format.as_raw());
+                xlog!("swapchain format {format:?} not offered: this GPU cannot render to it");
+            }
+        }
+        ok
     }
 
     pub(crate) fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags) -> Option<u32> {
@@ -526,7 +549,7 @@ impl SessionGfx {
     pub fn create_swapchain(&self, session: u64, ci: &xr::SwapchainCreateInfo) -> Result<SwapchainData, xr::Result> {
         let format = vk::Format::from_raw(ci.format as i32);
         let depth = is_depth(format);
-        if !depth && !COLOR_FORMATS.contains(&format) {
+        if (!depth && !COLOR_FORMATS.contains(&format)) || !self.renders_to(format) {
             return Err(xr::Result::ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED);
         }
         // 6 faces: a cube map for XR_KHR_composition_layer_cube (square faces).

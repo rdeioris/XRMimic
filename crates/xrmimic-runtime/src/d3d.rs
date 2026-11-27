@@ -459,8 +459,8 @@ impl SessionGfx {
 
     /// The formats this session's swapchains may have (DXGI, or Vulkan).
     pub fn swapchain_formats(&self) -> Vec<i64> {
-        if self.vk.is_some() {
-            crate::vkd3d::swapchain_formats()
+        if let Some(b) = &self.vk {
+            b.swapchain_formats()
         } else {
             swapchain_formats()
         }

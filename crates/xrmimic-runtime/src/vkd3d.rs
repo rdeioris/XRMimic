@@ -40,8 +40,8 @@ const FORMATS: [(vk::Format, DXGI_FORMAT, DXGI_FORMAT); 8] = [
     (vk::Format::D32_SFLOAT_S8_UINT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_D32_FLOAT),
 ];
 
-pub fn swapchain_formats() -> Vec<i64> {
-    FORMATS.iter().map(|f| f.0.as_raw() as i64).collect()
+fn all_formats() -> Vec<vk::Format> {
+    FORMATS.iter().map(|f| f.0).collect()
 }
 
 fn proxy_format(f: vk::Format) -> Option<(vk::Format, DXGI_FORMAT, DXGI_FORMAT)> {
@@ -264,6 +264,11 @@ pub unsafe fn session(next: *const std::ffi::c_void, shared: Arc<Shared>) -> Res
 }
 
 impl Bridge {
+    /// The formats offered: those with proxies that the app's GPU renders to.
+    pub fn swapchain_formats(&self) -> Vec<i64> {
+        all_formats().into_iter().filter(|&f| self.vk.renders_to(f)).map(|f| f.as_raw() as i64).collect()
+    }
+
     /// The app's swapchain images, and a proxy for each.
     pub fn create_swapchain(
         &self,
