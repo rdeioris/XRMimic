@@ -34,7 +34,7 @@ fn http(addr: &str, method: &str, path: &str, body: &str) -> std::io::Result<Vec
     let mut c = std::net::TcpStream::connect(addr.trim())?;
     write!(
         c,
-        "{method} {path} HTTP/1.1\r\nHost: xrmimic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.0\r\nHost: xrmimic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )?;
     let mut out = Vec::new();
